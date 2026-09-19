@@ -1,24 +1,41 @@
 # -*- coding: utf-8 -*-
 """
-LOCAL:ON 실제 데이터 기반 경로 추천 모델
-========================================
+LOCAL:ON 경로 추천 모델 v5.1
+==========================
+분리형 DB + 카테고리 공정비교 + 시장 정규화 고도화 버전
 
-현재 사용하는 원본 파일 4종
-1. 03_로컬발견가능성_지역별.csv
-2. 08_관광지ID_음식점매칭_최종_카카오좌표보완_최종.csv
-3. 01_인기관광지_전국통합_점수_최종.csv
-4. 01_인기관광지_전국통합_위경도_최최종.csv
+[지역]
+- 03_로컬발견가능성_지역별.csv
 
-추천 흐름
+[음식점]
+- restaurant_place_지역정규화.csv
+- restaurant_score.csv
+- restaurant_location.csv
+- place_restaurant.csv
+
+[전통시장]
+- traditional_market.csv
+- traditional_market_facility.csv
+- place_market.csv
+
+[관광지]
+- 01_인기관광지_전국통합_점수_최종.csv
+- 01_인기관광지_전국통합_위경도_최최종.csv
+
+[관광지 QA/비교]
+- 인기관광지_전국통합_점수(2).csv
+
+핵심 원칙
 ---------
-사용자 시도 선택
-→ 해당 시도 안 시군구를 로컬발견가능성 순위로 추천
-→ 사용자가 선택한 시군구(미선택 시 1위 지역)
-→ 맛집 / 관광지 / 카페·베이커리 선택
-→ 기존 순위 데이터로 장소 후보 선정
-→ 위경도 + 이동시간 + 시간대/카테고리 흐름을 고려해 당일치기/1박2일 경로 생성
-
-원본 파일은 읽기만 하며 절대 수정하지 않는다.
+1. 원본 CSV를 물리적으로 합치지 않는다.
+2. 실행 시 ID를 기준으로 메모리에서 JOIN한다.
+3. 음식점 점수는 restaurant_score.csv의 최종 추천점수를 그대로 사용한다.
+4. 전통시장은 별도 인기순위 데이터가 없으므로,
+   시장 규모(점포수) + 주차장 + 화장실을 이용한 '시장경로점수'를 사용한다.
+5. 관광지는 최종 점수 파일을 라우팅에 사용하고,
+   인기관광지_전국통합_점수(2).csv는 QA/감사용으로만 읽는다.
+6. 사용자 선택:
+   시도 → 시군구 → 카테고리 → 일정 유형 → 최종 경로
 """
 
 from __future__ import annotations
@@ -28,6 +45,7 @@ import re
 import json
 import math
 import argparse
+import difflib
 from pathlib import Path
 from typing import Optional
 
@@ -41,29 +59,67 @@ except ImportError:
 
 
 # ============================================================
-# 0. 파일 경로
+# 0. 경로 설정
 # ============================================================
 
-BASE_DIR = Path(r"C:\Users\User\Desktop\LOCAL_ON")
+DEFAULT_BASE_DIR = r"C:\Users\User\Desktop"
+BASE_DIR = Path(os.getenv("LOCAL_ON_BASE_DIR", DEFAULT_BASE_DIR))
 
-REGION_SCORE_PATH = BASE_DIR / "03_로컬발견가능성_지역별.csv"
-FOOD_PATH = BASE_DIR / "08_관광지ID_음식점매칭_최종_카카오좌표보완_최종.csv"
-TOUR_SCORE_PATH = BASE_DIR / "01_인기관광지_전국통합_점수_최종.csv"
-TOUR_GEO_PATH = BASE_DIR / "01_인기관광지_전국통합_위경도_최최종.csv"
+OUTPUT_DIR_NAME = "경로추천_결과"
 
-OUTPUT_DIR = BASE_DIR / "경로추천_결과"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# PowerShell:
-# $env:KAKAO_REST_API_KEY="REST_API_KEY"
-KAKAO_REST_API_KEY = os.getenv("KAKAO_REST_API_KEY", "").strip()
+def resolve_file(base_dir: Path, filename: str) -> Path:
+    """
+    실제 파일명은 바꾸지 않는다.
+    먼저 정확한 파일명을 찾고, 테스트 환경에서만 (1)~(9) 복사본도 허용한다.
+    """
+    exact = base_dir / filename
+    if exact.exists():
+        return exact
+
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix
+
+    for i in range(9, 0, -1):
+        alt = base_dir / f"{stem}({i}){suffix}"
+        if alt.exists():
+            return alt
+
+    raise FileNotFoundError(
+        f"파일을 찾을 수 없습니다: {filename}\n"
+        f"기준 폴더: {base_dir}"
+    )
+
+
+# 실제 데이터 파일명 그대로 유지
+REGION_SCORE_NAME = "03_로컬발견가능성_지역별.csv"
+
+RESTAURANT_PLACE_NAME = "restaurant_place_지역정규화.csv"
+RESTAURANT_SCORE_NAME = "restaurant_score.csv"
+RESTAURANT_LOCATION_NAME = "restaurant_location.csv"
+PLACE_RESTAURANT_NAME = "place_restaurant.csv"
+
+TRADITIONAL_MARKET_NAME = "traditional_market.csv"
+TRADITIONAL_MARKET_FACILITY_NAME = "traditional_market_facility.csv"
+PLACE_MARKET_NAME = "place_market.csv"
+
+TOUR_SCORE_FINAL_NAME = "01_인기관광지_전국통합_점수_최종.csv"
+TOUR_GEO_FINAL_NAME = "01_인기관광지_전국통합_위경도_최최종.csv"
+
+# 최종 경로 계산에는 사용하지 않고 QA에만 사용
+TOUR_SCORE_AUDIT_NAME = "인기관광지_전국통합_점수(2).csv"
 
 
 # ============================================================
 # 1. 모델 설정
 # ============================================================
 
-VALID_CATEGORIES = {"맛집", "관광지", "카페/베이커리"}
+VALID_CATEGORIES = {
+    "맛집",
+    "관광지",
+    "카페/베이커리",
+    "전통시장",
+}
 
 TRIP_CONFIG = {
     "2h": {
@@ -88,48 +144,46 @@ TRIP_CONFIG = {
     },
 }
 
-# 장소별 기본 체류시간
 STAY_MINUTES = {
     "맛집": 70,
     "관광지": 70,
     "카페/베이커리": 45,
+    "전통시장": 60,
 }
 
-
-# ============================================================
-# 일정 자연스러움 설정
-# ============================================================
-# 기본 여행 시작 시각. CLI --start-time 으로 변경 가능.
 DEFAULT_START_TIME = "10:00"
 
-# 식사/카페를 실제 여행 시간대에 가깝게 배치하기 위한 권장 구간
-LUNCH_WINDOW = (11 * 60 + 30, 14 * 60)       # 11:30 ~ 14:00
-DINNER_WINDOW = (17 * 60 + 30, 20 * 60)      # 17:30 ~ 20:00
-CAFE_WINDOW = (13 * 60, 17 * 60 + 30)        # 13:00 ~ 17:30
+LUNCH_WINDOW = (11 * 60 + 30, 14 * 60)
+DINNER_WINDOW = (17 * 60 + 30, 20 * 60)
+CAFE_WINDOW = (13 * 60, 17 * 60 + 30)
+MARKET_WINDOW = (10 * 60, 18 * 60)
 
-# 여러 카테고리를 선택했을 때 한 종류가 경로를 과점하지 않도록 제한.
-# 단, 사용자가 한 카테고리만 선택한 경우에는 적용하지 않는다.
 MULTI_CATEGORY_MAX_VISITS = {
     "맛집": 1,
     "카페/베이커리": 1,
+    "전통시장": 1,
     "관광지": 99,
 }
 
+TOP_CANDIDATES_PER_CATEGORY = 10
+BEAM_WIDTH = 180
 
-# 동일 관광권역으로 판단할 거리 기준(km)
 NEARBY_TOUR_CLUSTER_KM = 0.5
-
-# 동일 세부분류가 반복될 때 감점
 SAME_TOUR_SUBCATEGORY_PENALTY = 10.0
 
-# 경로 최적화 전에 각 카테고리에서 몇 개까지 후보로 남길지
-TOP_CANDIDATES_PER_CATEGORY = 10
+# 서로 다른 카테고리의 원점수를 직접 비교하지 않기 위한 공통 경로점수.
+# 각 카테고리 후보 내 순위 1위=100, 이후 5점씩 감소(최저 55).
+ROUTE_RANK_STEP = 5.0
+ROUTE_SCORE_FLOOR = 55.0
 
-# Beam Search 폭
-BEAM_WIDTH = 150
+# 관광지와 전통시장 DB가 사실상 같은 장소인지 판단할 거리.
+MARKET_DUPLICATE_DISTANCE_KM = 0.6
+MARKET_NAME_SIMILARITY = 0.72
 
-# 관광지에서 기본적으로 제외할 분류
-# 필요하면 삭제/추가 가능
+# 일반 관광 모드에서 특수 체험형 관광지가 과도하게 선정되는 것을 완화.
+GENERAL_TOUR_POSITIVE_BONUS = 5.0
+GENERAL_TOUR_SPECIAL_PENALTY = -12.0
+
 EXCLUDED_TOUR_CATEGORIES = {
     "쇼핑몰",
     "백화점",
@@ -137,6 +191,10 @@ EXCLUDED_TOUR_CATEGORIES = {
     "면세점",
     "전문매장/상가",
     "호스텔",
+    "호텔",
+    "모텔",
+    "교통시설",
+    "대형마트",
 }
 
 
@@ -145,9 +203,6 @@ EXCLUDED_TOUR_CATEGORIES = {
 # ============================================================
 
 def read_csv_safely(path: Path) -> pd.DataFrame:
-    if not path.exists():
-        raise FileNotFoundError(f"파일이 없습니다: {path}")
-
     last_error = None
 
     for enc in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
@@ -156,7 +211,9 @@ def read_csv_safely(path: Path) -> pd.DataFrame:
         except Exception as e:
             last_error = e
 
-    raise RuntimeError(f"CSV 읽기 실패: {path}\n{last_error}")
+    raise RuntimeError(
+        f"CSV 읽기 실패: {path}\n{last_error}"
+    )
 
 
 def to_numeric(series: pd.Series) -> pd.Series:
@@ -169,7 +226,37 @@ def to_numeric(series: pd.Series) -> pd.Series:
     )
 
 
-def haversine_km(lat1, lon1, lat2, lon2) -> float:
+def normalize_100(series: pd.Series) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce")
+    valid = s.dropna()
+
+    if valid.empty:
+        return pd.Series(
+            50.0,
+            index=s.index,
+            dtype=float,
+        )
+
+    lo = valid.min()
+    hi = valid.max()
+
+    if hi == lo:
+        out = pd.Series(
+            50.0,
+            index=s.index,
+            dtype=float,
+        )
+        return out
+
+    return (s - lo) / (hi - lo) * 100.0
+
+
+def haversine_km(
+    lat1,
+    lon1,
+    lat2,
+    lon2,
+) -> float:
     r = 6371.0088
 
     lat1 = math.radians(float(lat1))
@@ -182,92 +269,68 @@ def haversine_km(lat1, lon1, lat2, lon2) -> float:
 
     a = (
         math.sin(dlat / 2) ** 2
-        + math.cos(lat1) * math.cos(lat2)
+        + math.cos(lat1)
+        * math.cos(lat2)
         * math.sin(dlon / 2) ** 2
     )
 
     return 2 * r * math.asin(math.sqrt(a))
 
 
-def normalize_100(series: pd.Series) -> pd.Series:
-    s = pd.to_numeric(series, errors="coerce")
-    valid = s.dropna()
-
-    if valid.empty:
-        return pd.Series(np.nan, index=s.index, dtype=float)
-
-    lo = valid.min()
-    hi = valid.max()
-
-    if hi == lo:
-        out = pd.Series(np.nan, index=s.index, dtype=float)
-        out[s.notna()] = 50.0
-        return out
-
-    return (s - lo) / (hi - lo) * 100.0
-
-
-def food_rank_to_scores(
-    local_rank: pd.Series,
-    outsider_rank: pd.Series,
-) -> tuple[pd.Series, pd.Series, pd.Series]:
-    """
-    기존 순위 설계와 동일한 방향 사용.
-
-    현지인:
-      1위 100점 → 100위 50.5점 (0.5 간격)
-
-    외지인:
-      1위 50점 → 100위 0.5점 (0.5 간격)
-
-    두 점수가 모두 있으면 평균,
-    하나만 있으면 해당 점수 사용.
-    """
-    lr = pd.to_numeric(local_rank, errors="coerce")
-    er = pd.to_numeric(outsider_rank, errors="coerce")
-
-    local_score = 100.5 - 0.5 * lr
-    outsider_score = 50.5 - 0.5 * er
-
-    local_score = local_score.where(lr.between(1, 100))
-    outsider_score = outsider_score.where(er.between(1, 100))
-
-    combined = pd.concat(
-        [local_score, outsider_score],
-        axis=1
-    ).mean(axis=1, skipna=True)
-
-    combined[
-        local_score.isna() & outsider_score.isna()
-    ] = np.nan
-
-    return local_score, outsider_score, combined
-
-
-# ============================================================
-# 3. 지역별 로컬발견가능성
-# ============================================================
-
-def load_region_scores() -> pd.DataFrame:
-    df = read_csv_safely(REGION_SCORE_PATH).copy()
-
-    required = {
-        "시도",
-        "시군구",
-        "데이터개월수",
-        "신뢰도",
-        "로컬발견가능성",
-        "단기임시점수",
-    }
-
-    missing = required - set(df.columns)
+def require_columns(
+    df: pd.DataFrame,
+    columns: set[str],
+    label: str,
+):
+    missing = columns - set(df.columns)
 
     if missing:
         raise ValueError(
-            f"지역 점수 파일 필수 컬럼 누락: {sorted(missing)}"
+            f"{label} 필수 컬럼 누락: {sorted(missing)}"
         )
 
-    if df.duplicated(["시도", "시군구"]).any():
+
+def assert_unique(
+    df: pd.DataFrame,
+    key: str,
+    label: str,
+):
+    duplicated = df[key].duplicated().sum()
+
+    if duplicated:
+        raise ValueError(
+            f"{label}: {key} 중복 {duplicated}건"
+        )
+
+
+# ============================================================
+# 3. 지역 데이터
+# ============================================================
+
+def load_region_scores(base_dir: Path) -> pd.DataFrame:
+    path = resolve_file(
+        base_dir,
+        REGION_SCORE_NAME,
+    )
+
+    df = read_csv_safely(path).copy()
+
+    require_columns(
+        df,
+        {
+            "시도",
+            "시군구",
+            "데이터개월수",
+            "신뢰도",
+            "로컬발견가능성",
+            "단기임시점수",
+        },
+        REGION_SCORE_NAME,
+    )
+
+    if df.duplicated(
+        ["시도", "시군구"]
+    ).any():
         raise ValueError(
             "지역 점수 파일에 시도+시군구 중복이 존재합니다."
         )
@@ -275,6 +338,7 @@ def load_region_scores() -> pd.DataFrame:
     df["로컬발견가능성"] = to_numeric(
         df["로컬발견가능성"]
     )
+
     df["단기임시점수"] = to_numeric(
         df["단기임시점수"]
     )
@@ -286,24 +350,14 @@ def get_region_ranking(
     region_df: pd.DataFrame,
     selected_sido: str,
 ) -> pd.DataFrame:
-    """
-    같은 시도 안에서 지역 추천 순위를 만든다.
 
-    12개월 로컬발견가능성 점수와 2개월 단기임시점수는
-    직접 같은 척도로 섞지 않는다.
-
-    1) 12개월 정식 점수가 있는 지역 우선
-    2) 나머지는 '참고용'으로 별도 순위
-    """
     x = region_df[
         region_df["시도"] == selected_sido
     ].copy()
 
     if x.empty:
-        available = sorted(region_df["시도"].unique())
         raise ValueError(
-            f"'{selected_sido}' 데이터가 없습니다.\n"
-            f"가능한 시도: {available}"
+            f"'{selected_sido}' 지역 데이터가 없습니다."
         )
 
     formal = x[
@@ -316,8 +370,13 @@ def get_region_ranking(
     )
 
     formal["지역추천구분"] = "정식_12개월"
-    formal["지역추천점수"] = formal["로컬발견가능성"]
-    formal["시도내순위"] = np.arange(1, len(formal) + 1)
+    formal["지역추천점수"] = (
+        formal["로컬발견가능성"]
+    )
+    formal["시도내순위"] = np.arange(
+        1,
+        len(formal) + 1,
+    )
 
     short = x[
         x["로컬발견가능성"].isna()
@@ -330,40 +389,49 @@ def get_region_ranking(
     )
 
     short["지역추천구분"] = "참고_단기"
-    short["지역추천점수"] = short["단기임시점수"]
-    short["시도내순위"] = np.arange(1, len(short) + 1)
+    short["지역추천점수"] = (
+        short["단기임시점수"]
+    )
+    short["시도내순위"] = np.arange(
+        1,
+        len(short) + 1,
+    )
 
     result = pd.concat(
         [formal, short],
-        ignore_index=True
+        ignore_index=True,
     )
 
-    cols = [
-        "시도",
-        "시군구",
-        "데이터개월수",
-        "신뢰도",
-        "지역추천구분",
-        "지역추천점수",
-        "시도내순위",
-        "로컬발견가능성",
-        "단기임시점수",
+    return result[
+        [
+            "시도",
+            "시군구",
+            "데이터개월수",
+            "신뢰도",
+            "지역추천구분",
+            "지역추천점수",
+            "시도내순위",
+            "로컬발견가능성",
+            "단기임시점수",
+        ]
     ]
 
-    return result[cols]
-
 
 # ============================================================
-# 4. 맛집 / 카페·베이커리 데이터
+# 4. 음식점 데이터
 # ============================================================
 
-def classify_food(row: pd.Series) -> str:
-    text = " ".join([
-        str(row.get("업소명", "")),
-        str(row.get("분류", "")),
-        str(row.get("업태구분명", "")),
-        str(row.get("음식점구분", "")),
-    ]).lower()
+def classify_restaurant(
+    row: pd.Series,
+) -> str:
+
+    text = " ".join(
+        [
+            str(row.get("업소명", "")),
+            str(row.get("분류", "")),
+            str(row.get("name", "")),
+        ]
+    ).lower()
 
     cafe_keywords = [
         "카페",
@@ -378,93 +446,1049 @@ def classify_food(row: pd.Series) -> str:
         "디저트",
     ]
 
-    if any(k in text for k in cafe_keywords):
+    if any(
+        keyword in text
+        for keyword in cafe_keywords
+    ):
         return "카페/베이커리"
 
     return "맛집"
 
 
-def load_food_places() -> pd.DataFrame:
-    df = read_csv_safely(FOOD_PATH).copy()
+def load_restaurant_places(
+    base_dir: Path,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
 
-    required = {
-        "관광지ID",
-        "업소명",
-        "분류",
-        "맛집시도",
-        "맛집시군구",
+    place_info = read_csv_safely(
+        resolve_file(
+            base_dir,
+            RESTAURANT_PLACE_NAME,
+        )
+    )
+
+    score = read_csv_safely(
+        resolve_file(
+            base_dir,
+            RESTAURANT_SCORE_NAME,
+        )
+    )
+
+    location = read_csv_safely(
+        resolve_file(
+            base_dir,
+            RESTAURANT_LOCATION_NAME,
+        )
+    )
+
+    place = read_csv_safely(
+        resolve_file(
+            base_dir,
+            PLACE_RESTAURANT_NAME,
+        )
+    )
+
+    require_columns(
+        place_info,
+        {
+            "관광지ID",
+            "업소명",
+            "분류",
+            "현지인순위",
+            "외지인순위",
+            "표준시도",
+            "표준시군구",
+        },
+        RESTAURANT_PLACE_NAME,
+    )
+
+    require_columns(
+        score,
+        {
+            "관광지ID",
+            "현지인순위",
+            "외지인순위",
+            "현지인점수",
+            "외지인점수",
+            "추천점수",
+            "추천순위",
+        },
+        RESTAURANT_SCORE_NAME,
+    )
+
+    require_columns(
+        location,
+        {
+            "관광지ID",
+            "경도",
+            "위도",
+        },
+        RESTAURANT_LOCATION_NAME,
+    )
+
+    require_columns(
+        place,
+        {
+            "place_id",
+            "place_type",
+            "name",
+            "latitude",
+            "longitude",
+            "road_address",
+            "jibun_address",
+        },
+        PLACE_RESTAURANT_NAME,
+    )
+
+    for df, key, label in [
+        (
+            place_info,
+            "관광지ID",
+            RESTAURANT_PLACE_NAME,
+        ),
+        (
+            score,
+            "관광지ID",
+            RESTAURANT_SCORE_NAME,
+        ),
+        (
+            location,
+            "관광지ID",
+            RESTAURANT_LOCATION_NAME,
+        ),
+        (
+            place,
+            "place_id",
+            PLACE_RESTAURANT_NAME,
+        ),
+    ]:
+        assert_unique(
+            df,
+            key,
+            label,
+        )
+
+    # --------------------------------------------------------
+    # 4개 음식점 테이블 JOIN
+    # --------------------------------------------------------
+    merged = (
+        place_info
+        .merge(
+            score,
+            on="관광지ID",
+            how="inner",
+            suffixes=(
+                "_place",
+                "_score",
+            ),
+            validate="one_to_one",
+        )
+        .merge(
+            location[
+                [
+                    "관광지ID",
+                    "경도",
+                    "위도",
+                    "좌표보완방법",
+                    "좌표검색어",
+                ]
+            ],
+            on="관광지ID",
+            how="inner",
+            validate="one_to_one",
+        )
+        .merge(
+            place,
+            left_on="관광지ID",
+            right_on="place_id",
+            how="inner",
+            validate="one_to_one",
+        )
+    )
+
+    qa_rows = []
+
+    # ID 개수 검증
+    expected = len(place_info)
+
+    if len(merged) != expected:
+        qa_rows.append(
+            {
+                "데이터구분": "음식점",
+                "검사항목": "JOIN_행수",
+                "결과": len(merged),
+                "기대값": expected,
+                "상태": "확인필요",
+            }
+        )
+
+    # 순위 일치 검증
+    for col in (
         "현지인순위",
         "외지인순위",
-        "경도",
-        "위도",
-    }
+    ):
+        left = merged[
+            f"{col}_place"
+        ]
+        right = merged[
+            f"{col}_score"
+        ]
 
-    missing = required - set(df.columns)
+        mismatch = (
+            left.fillna(-999999)
+            != right.fillna(-999999)
+        ).sum()
 
-    if missing:
-        raise ValueError(
-            f"음식점 파일 필수 컬럼 누락: {sorted(missing)}"
+        qa_rows.append(
+            {
+                "데이터구분": "음식점",
+                "검사항목":
+                    f"{col}_테이블간불일치",
+                "결과": int(mismatch),
+                "기대값": 0,
+                "상태":
+                    (
+                        "정상"
+                        if mismatch == 0
+                        else "확인필요"
+                    ),
+            }
         )
 
-    df["위도"] = to_numeric(df["위도"])
-    df["경도"] = to_numeric(df["경도"])
+    # 위치 테이블과 place 테이블 좌표 일치 검증
+    lat_mismatch = (
+        (
+            to_numeric(
+                merged["위도"]
+            )
+            - to_numeric(
+                merged["latitude"]
+            )
+        ).abs()
+        > 1e-7
+    ).sum()
 
-    local_score, outsider_score, combined = (
-        food_rank_to_scores(
-            df["현지인순위"],
-            df["외지인순위"],
+    lon_mismatch = (
+        (
+            to_numeric(
+                merged["경도"]
+            )
+            - to_numeric(
+                merged["longitude"]
+            )
+        ).abs()
+        > 1e-7
+    ).sum()
+
+    qa_rows.extend(
+        [
+            {
+                "데이터구분": "음식점",
+                "검사항목":
+                    "위도_테이블간불일치",
+                "결과": int(lat_mismatch),
+                "기대값": 0,
+                "상태":
+                    (
+                        "정상"
+                        if lat_mismatch == 0
+                        else "확인필요"
+                    ),
+            },
+            {
+                "데이터구분": "음식점",
+                "검사항목":
+                    "경도_테이블간불일치",
+                "결과": int(lon_mismatch),
+                "기대값": 0,
+                "상태":
+                    (
+                        "정상"
+                        if lon_mismatch == 0
+                        else "확인필요"
+                    ),
+            },
+        ]
+    )
+
+    merged["추천카테고리"] = (
+        merged.apply(
+            classify_restaurant,
+            axis=1,
         )
     )
 
-    df["현지인점수_계산"] = local_score
-    df["외지인점수_계산"] = outsider_score
-    df["장소추천점수"] = combined
+    road = merged[
+        "road_address"
+    ].fillna("")
 
-    df["추천카테고리"] = df.apply(
-        classify_food,
-        axis=1
+    jibun = merged[
+        "jibun_address"
+    ].fillna("")
+
+    address = road.where(
+        road.str.strip().ne(""),
+        jibun,
     )
 
-    out = pd.DataFrame({
-        "place_id": df["관광지ID"].astype(str),
-        "장소명": df["업소명"].astype(str),
-        "추천카테고리": df["추천카테고리"],
-        "세부분류": df["분류"].astype(str),
-        "시도": df["맛집시도"].astype(str),
-        "시군구": df["맛집시군구"].astype(str),
-        "현지인순위": to_numeric(df["현지인순위"]),
-        "외지인순위": to_numeric(df["외지인순위"]),
-        "현지인점수": local_score,
-        "외지인점수": outsider_score,
-        "장소추천점수": combined,
-        "위도": df["위도"],
-        "경도": df["경도"],
-        "주소": df.get(
-            "도로명주소",
-            pd.Series("", index=df.index)
-        ).fillna(""),
-        "원본구분": "음식점",
-    })
+    out = pd.DataFrame(
+        {
+            "place_id":
+                merged["관광지ID"].astype(str),
+            "장소명":
+                merged["업소명"].astype(str),
+            "추천카테고리":
+                merged["추천카테고리"],
+            "세부분류":
+                merged["분류"].astype(str),
+            "시도":
+                merged["표준시도"].astype(str),
+            "시군구":
+                merged["표준시군구"].astype(str),
+            "현지인순위":
+                to_numeric(
+                    merged["현지인순위_score"]
+                ),
+            "외지인순위":
+                to_numeric(
+                    merged["외지인순위_score"]
+                ),
+            "현지인점수":
+                to_numeric(
+                    merged["현지인점수"]
+                ),
+            "외지인점수":
+                to_numeric(
+                    merged["외지인점수"]
+                ),
+            "장소추천점수":
+                to_numeric(
+                    merged["추천점수"]
+                ),
+            "원본추천순위":
+                to_numeric(
+                    merged["추천순위"]
+                ),
+            "위도":
+                to_numeric(
+                    merged["위도"]
+                ),
+            "경도":
+                to_numeric(
+                    merged["경도"]
+                ),
+            "주소":
+                address,
+            "부가정보":
+                "",
+            "원본구분":
+                "음식점",
+            "지역매칭상태":
+                "정규화완료",
+        }
+    )
 
-    # 좌표/지역/점수 사용 가능 행만
     out = out[
-        out["위도"].between(32, 39.5)
-        & out["경도"].between(124, 132.5)
+        out["위도"].between(
+            32,
+            39.5,
+        )
+        & out["경도"].between(
+            124,
+            132.5,
+        )
         & out["장소추천점수"].notna()
         & out["시도"].ne("")
         & out["시군구"].ne("")
     ].copy()
 
-    if out["place_id"].duplicated().any():
-        raise ValueError(
-            "음식점 데이터 관광지ID가 중복되어 있습니다."
-        )
+    qa_rows.append(
+        {
+            "데이터구분": "음식점",
+            "검사항목": "최종사용가능행",
+            "결과": len(out),
+            "기대값": len(place_info),
+            "상태":
+                (
+                    "정상"
+                    if len(out) == len(place_info)
+                    else "확인필요"
+                ),
+        }
+    )
 
-    return out.reset_index(drop=True)
+    return (
+        out.reset_index(drop=True),
+        pd.DataFrame(qa_rows),
+    )
 
 
 # ============================================================
-# 5. 관광지 점수 + 좌표 데이터
+# 5. 전통시장 데이터
+# ============================================================
+
+
+def normalize_address_text(address: str) -> str:
+    """
+    공공데이터 주소의 흔한 표기 차이/오탈자를 모델 내부에서만 보정한다.
+    원본 CSV는 수정하지 않는다.
+    """
+    if pd.isna(address):
+        return ""
+
+    text = str(address).strip()
+
+    replacements = {
+        "전북특별차치도": "전북특별자치도",
+        "전라북도": "전북특별자치도",
+        "강원도": "강원특별자치도",
+        "제주도": "제주특별자치도",
+        "충남 ": "충청남도 ",
+        "충북 ": "충청북도 ",
+        "경남 ": "경상남도 ",
+        "경북 ": "경상북도 ",
+        "전남 ": "전라남도 ",
+    }
+
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text
+
+
+def parse_basic_region_from_address(
+    address: str,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    주소 자체에서 시도 / 기본 시군구 / 하위구를 먼저 추출한다.
+    예:
+      충청남도 천안시 서북구 ... -> 충청남도, 천안시, 서북구
+      서울특별시 노원구 ...      -> 서울특별시, 노원구, None
+    """
+    text = normalize_address_text(address)
+
+    if not text:
+        return None, None, None
+
+    tokens = text.split()
+
+    if not tokens:
+        return None, None, None
+
+    sido = ADDRESS_SIDO_MAP.get(tokens[0])
+
+    if sido is None:
+        return None, None, None
+
+    if sido == "세종특별자치시":
+        return sido, "세종특별자치시", None
+
+    if len(tokens) < 2:
+        return sido, None, None
+
+    primary = tokens[1]
+    sub = None
+
+    if (
+        len(tokens) >= 3
+        and primary.endswith("시")
+        and tokens[2].endswith("구")
+    ):
+        sub = tokens[2]
+
+    return sido, primary, sub
+
+
+ADDRESS_SIDO_MAP = {
+    "서울특별시": "서울특별시",
+    "서울": "서울특별시",
+    "부산광역시": "부산광역시",
+    "부산": "부산광역시",
+    "대구광역시": "대구광역시",
+    "대구": "대구광역시",
+    "인천광역시": "인천광역시",
+    "인천": "인천광역시",
+    "광주광역시": "광주광역시",
+    "광주": "광주광역시",
+    "대전광역시": "대전광역시",
+    "대전": "대전광역시",
+    "울산광역시": "울산광역시",
+    "울산": "울산광역시",
+    "세종특별자치시": "세종특별자치시",
+    "세종": "세종특별자치시",
+    "경기도": "경기도",
+    "경기": "경기도",
+    "강원특별자치도": "강원특별자치도",
+    "강원도": "강원특별자치도",
+    "충청북도": "충청북도",
+    "충북": "충청북도",
+    "충청남도": "충청남도",
+    "충남": "충청남도",
+    "전북특별자치도": "전북특별자치도",
+    "전라북도": "전북특별자치도",
+    "전라남도": "전라남도",
+    "전남": "전라남도",
+    "경상북도": "경상북도",
+    "경북": "경상북도",
+    "경상남도": "경상남도",
+    "경남": "경상남도",
+    "제주특별자치도": "제주특별자치도",
+    "제주도": "제주특별자치도",
+}
+
+
+def parse_region_from_address(
+    address: str,
+    valid_region_keys: set[tuple[str, str]],
+) -> tuple[Optional[str], Optional[str], str]:
+    """
+    반환:
+      (시도, 시군구, 매칭상태)
+
+    매칭상태:
+      - exact
+      - compound
+      - fallback
+      - region_score_unsupported
+      - parse_failed
+
+    지역 점수 데이터에 없는 지역이라고 해서 주소 파싱 자체를 실패로
+    처리하지 않는다. 예: 서울특별시는 현재 로컬발견가능성 데이터가
+    없을 수 있으므로 '지역점수미지원'으로 구분한다.
+    """
+    sido, primary, sub = parse_basic_region_from_address(
+        address
+    )
+
+    if sido is None:
+        return None, None, "parse_failed"
+
+    # 세종
+    if sido == "세종특별자치시":
+        for candidate in (
+            "세종특별자치시",
+            "세종시",
+            "세종",
+        ):
+            if (sido, candidate) in valid_region_keys:
+                return sido, candidate, "exact"
+
+        return sido, "세종특별자치시", "region_score_unsupported"
+
+    # 시+구 복합 행정구역을 가장 먼저 확인
+    if primary and sub:
+        compound = f"{primary}+{sub}"
+
+        if (sido, compound) in valid_region_keys:
+            return sido, compound, "compound"
+
+    # 기본 시군구
+    if primary and (sido, primary) in valid_region_keys:
+        return sido, primary, "exact"
+
+    # 주소 전체에서 로컬발견가능성 지역명을 다시 탐색
+    normalized_text = normalize_address_text(
+        address
+    ).replace(" ", "")
+
+    candidates = [
+        sigungu
+        for s, sigungu in valid_region_keys
+        if s == sido
+    ]
+
+    candidates.sort(
+        key=len,
+        reverse=True,
+    )
+
+    for sigungu in candidates:
+        target = (
+            str(sigungu)
+            .replace("+", "")
+            .replace(" ", "")
+        )
+
+        if target and target in normalized_text:
+            return sido, sigungu, "fallback"
+
+    # 주소 파싱은 성공했지만 지역 점수 테이블이 해당 지역을 지원하지 않음
+    if primary:
+        return sido, (
+            f"{primary}+{sub}"
+            if sub
+            else primary
+        ), "region_score_unsupported"
+
+    return sido, None, "parse_failed"
+
+
+def market_route_score(
+    stores: pd.Series,
+    parking: pd.Series,
+    restroom: pd.Series,
+) -> pd.Series:
+    """
+    전통시장은 현지인/외지인 인기순위가 없으므로
+    '추천점수'와 동일한 의미로 취급하지 않는다.
+
+    경로 안에서 시장 후보를 정렬하기 위한 시장경로점수:
+      - 기본 50점
+      - 점포수 규모: 최대 30점
+      - 주차장: 10점
+      - 공중화장실: 10점
+
+    점포수는 log1p 후 Min-Max 정규화하여 대형시장 이상치 영향을 완화한다.
+    """
+    stores_num = to_numeric(
+        stores
+    ).fillna(0)
+
+    store_component = (
+        normalize_100(
+            np.log1p(stores_num)
+        )
+        * 0.30
+    )
+
+    parking_component = (
+        parking.astype(str)
+        .str.upper()
+        .eq("Y")
+        .astype(float)
+        * 10.0
+    )
+
+    restroom_component = (
+        restroom.astype(str)
+        .str.upper()
+        .eq("Y")
+        .astype(float)
+        * 10.0
+    )
+
+    return (
+        50.0
+        + store_component
+        + parking_component
+        + restroom_component
+    ).clip(
+        lower=0,
+        upper=100,
+    )
+
+
+def load_market_places(
+    base_dir: Path,
+    region_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+
+    market = read_csv_safely(
+        resolve_file(
+            base_dir,
+            TRADITIONAL_MARKET_NAME,
+        )
+    )
+
+    facility = read_csv_safely(
+        resolve_file(
+            base_dir,
+            TRADITIONAL_MARKET_FACILITY_NAME,
+        )
+    )
+
+    place = read_csv_safely(
+        resolve_file(
+            base_dir,
+            PLACE_MARKET_NAME,
+        )
+    )
+
+    require_columns(
+        market,
+        {
+            "market_id",
+            "시장명",
+            "시장유형",
+            "소재지도로명주소",
+            "소재지지번주소",
+            "위도",
+            "경도",
+            "점포수",
+            "취급품목",
+        },
+        TRADITIONAL_MARKET_NAME,
+    )
+
+    require_columns(
+        facility,
+        {
+            "market_id",
+            "공중화장실보유여부",
+            "주차장보유여부",
+        },
+        TRADITIONAL_MARKET_FACILITY_NAME,
+    )
+
+    require_columns(
+        place,
+        {
+            "place_id",
+            "place_type",
+            "name",
+            "latitude",
+            "longitude",
+            "road_address",
+            "jibun_address",
+        },
+        PLACE_MARKET_NAME,
+    )
+
+    assert_unique(
+        market,
+        "market_id",
+        TRADITIONAL_MARKET_NAME,
+    )
+    assert_unique(
+        facility,
+        "market_id",
+        TRADITIONAL_MARKET_FACILITY_NAME,
+    )
+    assert_unique(
+        place,
+        "place_id",
+        PLACE_MARKET_NAME,
+    )
+
+    merged = (
+        market
+        .merge(
+            facility,
+            on="market_id",
+            how="inner",
+            validate="one_to_one",
+        )
+        .merge(
+            place,
+            left_on="market_id",
+            right_on="place_id",
+            how="inner",
+            suffixes=(
+                "_market",
+                "_place",
+            ),
+            validate="one_to_one",
+        )
+    )
+
+    qa_rows = []
+
+    expected = len(market)
+
+    qa_rows.append(
+        {
+            "데이터구분": "전통시장",
+            "검사항목": "JOIN_행수",
+            "결과": len(merged),
+            "기대값": expected,
+            "상태":
+                (
+                    "정상"
+                    if len(merged) == expected
+                    else "확인필요"
+                ),
+        }
+    )
+
+    lat_mismatch = (
+        (
+            to_numeric(
+                merged["위도"]
+            )
+            - to_numeric(
+                merged["latitude"]
+            )
+        ).abs()
+        > 1e-7
+    ).sum()
+
+    lon_mismatch = (
+        (
+            to_numeric(
+                merged["경도"]
+            )
+            - to_numeric(
+                merged["longitude"]
+            )
+        ).abs()
+        > 1e-7
+    ).sum()
+
+    qa_rows.extend(
+        [
+            {
+                "데이터구분": "전통시장",
+                "검사항목":
+                    "위도_테이블간불일치",
+                "결과": int(lat_mismatch),
+                "기대값": 0,
+                "상태":
+                    (
+                        "정상"
+                        if lat_mismatch == 0
+                        else "확인필요"
+                    ),
+            },
+            {
+                "데이터구분": "전통시장",
+                "검사항목":
+                    "경도_테이블간불일치",
+                "결과": int(lon_mismatch),
+                "기대값": 0,
+                "상태":
+                    (
+                        "정상"
+                        if lon_mismatch == 0
+                        else "확인필요"
+                    ),
+            },
+        ]
+    )
+
+    valid_region_keys = set(
+        zip(
+            region_df["시도"].astype(str),
+            region_df["시군구"].astype(str),
+        )
+    )
+
+    road = merged[
+        "소재지도로명주소"
+    ].fillna("")
+
+    jibun = merged[
+        "소재지지번주소"
+    ].fillna("")
+
+    address = road.where(
+        road.str.strip().ne(""),
+        jibun,
+    )
+
+    parsed = [
+        parse_region_from_address(
+            addr,
+            valid_region_keys,
+        )
+        for addr in address
+    ]
+
+    merged["시도"] = [
+        x[0]
+        for x in parsed
+    ]
+
+    merged["시군구"] = [
+        x[1]
+        for x in parsed
+    ]
+
+    merged["지역매칭상태"] = [
+        x[2]
+        for x in parsed
+    ]
+
+    merged["시장경로점수"] = (
+        market_route_score(
+            merged["점포수"],
+            merged["주차장보유여부"],
+            merged["공중화장실보유여부"],
+        )
+    )
+
+    info = (
+        "시장유형="
+        + merged["시장유형"].fillna("").astype(str)
+        + "; 점포수="
+        + merged["점포수"].fillna("").astype(str)
+        + "; 주차장="
+        + merged[
+            "주차장보유여부"
+        ].fillna("").astype(str)
+        + "; 화장실="
+        + merged[
+            "공중화장실보유여부"
+        ].fillna("").astype(str)
+        + "; 취급품목="
+        + merged["취급품목"].fillna("").astype(str)
+    )
+
+    out = pd.DataFrame(
+        {
+            "place_id":
+                merged["market_id"].astype(str),
+            "장소명":
+                merged["시장명"].astype(str),
+            "추천카테고리":
+                "전통시장",
+            "세부분류":
+                merged["시장유형"].fillna(
+                    "전통시장"
+                ).astype(str),
+            "시도":
+                merged["시도"],
+            "시군구":
+                merged["시군구"],
+            "현지인순위":
+                np.nan,
+            "외지인순위":
+                np.nan,
+            "현지인점수":
+                np.nan,
+            "외지인점수":
+                np.nan,
+            "장소추천점수":
+                merged["시장경로점수"],
+            "원본추천순위":
+                np.nan,
+            "위도":
+                to_numeric(
+                    merged["위도"]
+                ),
+            "경도":
+                to_numeric(
+                    merged["경도"]
+                ),
+            "주소":
+                address,
+            "부가정보":
+                info,
+            "원본구분":
+                "전통시장",
+        }
+    )
+
+    # 지역 매칭 상태를 출력에도 보존
+    out["지역매칭상태"] = merged[
+        "지역매칭상태"
+    ].values
+
+    parse_failed_count = int(
+        (
+            merged["지역매칭상태"]
+            == "parse_failed"
+        ).sum()
+    )
+
+    unsupported_count = int(
+        (
+            merged["지역매칭상태"]
+            == "region_score_unsupported"
+        ).sum()
+    )
+
+    qa_rows.extend(
+        [
+            {
+                "데이터구분": "전통시장",
+                "검사항목": "주소파싱실패",
+                "결과": parse_failed_count,
+                "기대값": 0,
+                "상태":
+                    (
+                        "정상"
+                        if parse_failed_count == 0
+                        else "확인필요"
+                    ),
+            },
+            {
+                "데이터구분": "전통시장",
+                "검사항목": "지역점수미지원",
+                "결과": unsupported_count,
+                "기대값": "정보",
+                "상태": "정보",
+            },
+        ]
+    )
+
+    # 실제 경로 추천에는 로컬발견가능성 지역키가 존재하는 시장만 사용.
+    # 단, 미지원 지역과 주소 파싱 오류는 QA에서 구분된다.
+    supported_mask = pd.Series(
+        [
+            (str(sido), str(sigungu))
+            in valid_region_keys
+            for sido, sigungu in zip(
+                out["시도"],
+                out["시군구"],
+            )
+        ],
+        index=out.index,
+    )
+
+    out = out[
+        supported_mask
+        & out["위도"].between(
+            32,
+            39.5,
+        )
+        & out["경도"].between(
+            124,
+            132.5,
+        )
+    ].copy()
+
+    # 지역점수 미지원 시장은 데이터 오류가 아니라 현재 지역추천 범위 밖이므로
+    # '최종사용가능행'과 분리해서 평가한다.
+    accounted = (
+        len(out)
+        + unsupported_count
+        + parse_failed_count
+    )
+
+    qa_rows.append(
+        {
+            "데이터구분": "전통시장",
+            "검사항목":
+                "지역점수지원_사용가능행",
+            "결과": len(out),
+            "기대값":
+                expected
+                - unsupported_count
+                - parse_failed_count,
+            "상태":
+                (
+                    "정상"
+                    if accounted == expected
+                    else "확인필요"
+                ),
+        }
+    )
+
+    qa_rows.append(
+        {
+            "데이터구분": "전통시장",
+            "검사항목":
+                "전체행수_설명가능여부",
+            "결과": accounted,
+            "기대값": expected,
+            "상태":
+                (
+                    "정상"
+                    if accounted == expected
+                    else "확인필요"
+                ),
+        }
+    )
+
+    return (
+        out.reset_index(drop=True),
+        pd.DataFrame(qa_rows),
+    )
+
+
+# ============================================================
+# 6. 관광지 데이터
 # ============================================================
 
 SIDO_PREFIX_MAP = {
@@ -487,61 +1511,16 @@ SIDO_PREFIX_MAP = {
     "제주": "제주특별자치도",
 }
 
-ADDRESS_SIDO_PREFIXES = [
-    ("서울특별시", "서울특별시"),
-    ("서울", "서울특별시"),
-    ("부산광역시", "부산광역시"),
-    ("부산", "부산광역시"),
-    ("대구광역시", "대구광역시"),
-    ("대구", "대구광역시"),
-    ("인천광역시", "인천광역시"),
-    ("인천", "인천광역시"),
-    ("광주광역시", "광주광역시"),
-    ("광주", "광주광역시"),
-    ("대전광역시", "대전광역시"),
-    ("대전", "대전광역시"),
-    ("울산광역시", "울산광역시"),
-    ("울산", "울산광역시"),
-    ("세종특별자치시", "세종특별자치시"),
-    ("세종", "세종특별자치시"),
-    ("경기도", "경기도"),
-    ("경기", "경기도"),
-    ("강원특별자치도", "강원특별자치도"),
-    ("강원도", "강원특별자치도"),
-    ("강원", "강원특별자치도"),
-    ("충청북도", "충청북도"),
-    ("충북", "충청북도"),
-    ("충청남도", "충청남도"),
-    ("충남", "충청남도"),
-    ("전북특별자치도", "전북특별자치도"),
-    ("전라북도", "전북특별자치도"),
-    ("전북", "전북특별자치도"),
-    ("전라남도", "전라남도"),
-    ("전남", "전라남도"),
-    ("경상북도", "경상북도"),
-    ("경북", "경상북도"),
-    ("경상남도", "경상남도"),
-    ("경남", "경상남도"),
-    ("제주특별자치도", "제주특별자치도"),
-    ("제주도", "제주특별자치도"),
-    ("제주", "제주특별자치도"),
-]
 
+def extract_sigungu_from_source(
+    filename: str,
+) -> Optional[str]:
 
-def extract_sigungu_from_source(filename: str) -> Optional[str]:
-    """
-    예:
-    20260913003004_고양시+일산서구_202509-202608_...csv
-    → 고양시+일산서구
-
-    강원20260913024754_강릉시_202509-202608_...csv
-    → 강릉시
-    """
     text = str(filename)
 
     m = re.search(
         r"_([^_]+)_\d{6}-\d{6}_",
-        text
+        text,
     )
 
     if m:
@@ -558,113 +1537,271 @@ def infer_sido_from_tour_row(
     source = str(source_file)
     address = str(address)
 
-    # 광주/대전/부산 등 파일 자체에 시도 prefix가 있을 때 가장 신뢰
-    for prefix, standard in SIDO_PREFIX_MAP.items():
+    for prefix, standard in (
+        SIDO_PREFIX_MAP.items()
+    ):
         if source.startswith(prefix):
             return standard
 
-    # 주소에 '전남광주통합특별시'가 있더라도
-    # source가 광주 prefix였다면 위에서 이미 광주로 처리됨.
-    for prefix, standard in ADDRESS_SIDO_PREFIXES:
+    for prefix, standard in (
+        ADDRESS_SIDO_MAP.items()
+    ):
         if address.startswith(prefix):
             return standard
 
     return None
 
 
-def load_tour_places(
-    region_df: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+def audit_raw_tour_score(
+    base_dir: Path,
+    final_score: pd.DataFrame,
+    geo: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    인기관광지_전국통합_점수(2).csv를 최종 라우팅에 넣지 않고,
+    최종 데이터와 비교하는 QA 자료로 사용.
+    """
+    rows = []
 
-    score = read_csv_safely(
-        TOUR_SCORE_PATH
-    ).copy()
-
-    geo = read_csv_safely(
-        TOUR_GEO_PATH
-    ).copy()
-
-    score_required = {
-        "관광지ID",
-        "관광지명",
-        "분류",
-        "현지인순위",
-        "외지인순위",
-        "현지인점수",
-        "외지인점수",
-        "추천점수",
-        "전국추천순위",
-        "원본파일",
-    }
-
-    geo_required = {
-        "관광지ID",
-        "관광지명",
-        "위도",
-        "경도",
-        "주소",
-    }
-
-    if score_required - set(score.columns):
-        raise ValueError(
-            "관광지 점수 파일 필수 컬럼이 부족합니다."
+    try:
+        raw_path = resolve_file(
+            base_dir,
+            TOUR_SCORE_AUDIT_NAME,
+        )
+    except FileNotFoundError:
+        return pd.DataFrame(
+            [
+                {
+                    "데이터구분": "관광지_RAW",
+                    "검사항목": "파일존재",
+                    "결과": 0,
+                    "기대값": 1,
+                    "상태": "선택파일없음",
+                }
+            ]
         )
 
-    if geo_required - set(geo.columns):
-        raise ValueError(
-            "관광지 좌표 파일 필수 컬럼이 부족합니다."
-        )
+    raw = read_csv_safely(
+        raw_path
+    )
 
-    # --------------------------------------------------------
-    # 좌표 파일 중복 ID 검증
-    # 서로 다른 좌표를 가진 중복 ID는 임의 선택하지 않고 모델에서 제외
-    # --------------------------------------------------------
-    geo["위도"] = to_numeric(geo["위도"])
-    geo["경도"] = to_numeric(geo["경도"])
+    require_columns(
+        raw,
+        {
+            "관광지ID",
+            "추천점수",
+        },
+        TOUR_SCORE_AUDIT_NAME,
+    )
 
-    duplicate_ids = set(
-        geo.loc[
-            geo["관광지ID"].duplicated(keep=False),
+    raw_dup_rows = int(
+        raw["관광지ID"]
+        .duplicated()
+        .sum()
+    )
+
+    raw_dup_ids = int(
+        raw.loc[
+            raw["관광지ID"]
+            .duplicated(keep=False),
+            "관광지ID",
+        ].nunique()
+    )
+
+    raw_ids = set(
+        raw["관광지ID"].astype(str)
+    )
+
+    geo_ids = set(
+        geo["관광지ID"].astype(str)
+    )
+
+    final_ids = set(
+        final_score[
             "관광지ID"
         ].astype(str)
     )
 
-    qa_rows = []
-
-    for pid in sorted(duplicate_ids):
-        g = geo[
-            geo["관광지ID"].astype(str) == pid
+    rows.extend(
+        [
+            {
+                "데이터구분": "관광지_RAW",
+                "검사항목": "전체행수",
+                "결과": len(raw),
+                "기대값": "",
+                "상태": "정보",
+            },
+            {
+                "데이터구분": "관광지_RAW",
+                "검사항목": "중복ID수",
+                "결과": raw_dup_ids,
+                "기대값": 0,
+                "상태":
+                    (
+                        "정상"
+                        if raw_dup_ids == 0
+                        else "최종입력사용금지"
+                    ),
+            },
+            {
+                "데이터구분": "관광지_RAW",
+                "검사항목": "중복추가행수",
+                "결과": raw_dup_rows,
+                "기대값": 0,
+                "상태":
+                    (
+                        "정상"
+                        if raw_dup_rows == 0
+                        else "최종입력사용금지"
+                    ),
+            },
+            {
+                "데이터구분": "관광지_RAW",
+                "검사항목": "좌표파일미매칭ID수",
+                "결과":
+                    len(
+                        raw_ids
+                        - geo_ids
+                    ),
+                "기대값": 0,
+                "상태": "정보",
+            },
+            {
+                "데이터구분": "관광지_RAW",
+                "검사항목":
+                    "최종점수파일에없는RAW_ID수",
+                "결과":
+                    len(
+                        raw_ids
+                        - final_ids
+                    ),
+                "기대값": 0,
+                "상태": "정보",
+            },
         ]
-
-        unique_coords = g[
-            ["위도", "경도"]
-        ].drop_duplicates()
-
-        if len(unique_coords) > 1:
-            qa_rows.append({
-                "관광지ID": pid,
-                "문제": "동일ID_서로다른좌표",
-                "행수": len(g),
-            })
-
-    bad_geo_ids = {
-        r["관광지ID"]
-        for r in qa_rows
-    }
-
-    geo_clean = geo[
-        ~geo["관광지ID"].astype(str).isin(
-            bad_geo_ids
-        )
-    ].drop_duplicates(
-        subset=["관광지ID"],
-        keep="first",
     )
 
-    # --------------------------------------------------------
-    # 점수 + 좌표를 메모리에서만 JOIN
-    # 원본 CSV 파일 자체는 변경하지 않음
-    # --------------------------------------------------------
+    return pd.DataFrame(rows)
+
+
+def load_tour_places(
+    base_dir: Path,
+    region_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+
+    score = read_csv_safely(
+        resolve_file(
+            base_dir,
+            TOUR_SCORE_FINAL_NAME,
+        )
+    )
+
+    geo = read_csv_safely(
+        resolve_file(
+            base_dir,
+            TOUR_GEO_FINAL_NAME,
+        )
+    )
+
+    require_columns(
+        score,
+        {
+            "관광지ID",
+            "관광지명",
+            "분류",
+            "현지인순위",
+            "외지인순위",
+            "현지인점수",
+            "외지인점수",
+            "추천점수",
+            "전국추천순위",
+            "원본파일",
+        },
+        TOUR_SCORE_FINAL_NAME,
+    )
+
+    require_columns(
+        geo,
+        {
+            "관광지ID",
+            "관광지명",
+            "위도",
+            "경도",
+            "주소",
+        },
+        TOUR_GEO_FINAL_NAME,
+    )
+
+    assert_unique(
+        score,
+        "관광지ID",
+        TOUR_SCORE_FINAL_NAME,
+    )
+
+    qa_rows = []
+
+    geo["위도"] = to_numeric(
+        geo["위도"]
+    )
+    geo["경도"] = to_numeric(
+        geo["경도"]
+    )
+
+    duplicate_ids = set(
+        geo.loc[
+            geo["관광지ID"]
+            .duplicated(keep=False),
+            "관광지ID",
+        ].astype(str)
+    )
+
+    bad_geo_ids = set()
+
+    for pid in sorted(
+        duplicate_ids
+    ):
+        g = geo[
+            geo["관광지ID"]
+            .astype(str)
+            == pid
+        ]
+
+        unique_coords = (
+            g[
+                [
+                    "위도",
+                    "경도",
+                ]
+            ]
+            .drop_duplicates()
+        )
+
+        if len(unique_coords) > 1:
+            bad_geo_ids.add(pid)
+
+            qa_rows.append(
+                {
+                    "데이터구분": "관광지",
+                    "검사항목":
+                        "동일ID_서로다른좌표",
+                    "결과": pid,
+                    "기대값": "중복없음",
+                    "상태": "제외",
+                }
+            )
+
+    geo_clean = (
+        geo[
+            ~geo["관광지ID"]
+            .astype(str)
+            .isin(bad_geo_ids)
+        ]
+        .drop_duplicates(
+            subset=["관광지ID"],
+            keep="first",
+        )
+    )
+
     merged = score.merge(
         geo_clean[
             [
@@ -679,25 +1816,31 @@ def load_tour_places(
         validate="one_to_one",
     )
 
-    # 좌표가 없는 점수 데이터 QA
     missing_geo = merged[
         merged["위도"].isna()
         | merged["경도"].isna()
     ]
 
-    for _, r in missing_geo.iterrows():
-        qa_rows.append({
-            "관광지ID": str(r["관광지ID"]),
-            "문제": "좌표없음",
-            "행수": 1,
-        })
+    qa_rows.append(
+        {
+            "데이터구분": "관광지",
+            "검사항목": "좌표없음",
+            "결과": len(missing_geo),
+            "기대값": 0,
+            "상태":
+                (
+                    "정상"
+                    if len(missing_geo) == 0
+                    else "제외"
+                ),
+        }
+    )
 
-    # --------------------------------------------------------
-    # 지역 추출
-    # --------------------------------------------------------
     merged["시군구"] = (
         merged["원본파일"]
-        .apply(extract_sigungu_from_source)
+        .apply(
+            extract_sigungu_from_source
+        )
     )
 
     merged["시도"] = [
@@ -705,34 +1848,13 @@ def load_tour_places(
             source,
             address,
         )
-        for source, address in zip(
+        for source, address
+        in zip(
             merged["원본파일"],
             merged["주소"].fillna(""),
         )
     ]
 
-    # 지역 점수 테이블을 이용해 시도 보완
-    # 시군구 이름이 전국에서 유일할 때만 안전하게 보완
-    sigungu_to_sidos = (
-        region_df.groupby("시군구")["시도"]
-        .agg(lambda x: list(pd.unique(x)))
-        .to_dict()
-    )
-
-    for idx in merged.index[
-        merged["시도"].isna()
-    ]:
-        sg = merged.at[idx, "시군구"]
-
-        sidos = sigungu_to_sidos.get(
-            sg,
-            []
-        )
-
-        if len(sidos) == 1:
-            merged.at[idx, "시도"] = sidos[0]
-
-    # 지역키가 03 파일에 실제 존재하는지 검증
     valid_region_keys = set(
         zip(
             region_df["시도"].astype(str),
@@ -740,100 +1862,541 @@ def load_tour_places(
         )
     )
 
-    valid_region_mask = [
-        (str(sido), str(sigungu))
-        in valid_region_keys
-        for sido, sigungu in zip(
-            merged["시도"],
-            merged["시군구"],
+    sigungu_to_sidos = (
+        region_df
+        .groupby("시군구")["시도"]
+        .agg(
+            lambda x:
+                list(
+                    pd.unique(x)
+                )
         )
-    ]
+        .to_dict()
+    )
 
-    bad_region = merged[
-        ~pd.Series(
-            valid_region_mask,
-            index=merged.index
+    for idx in merged.index[
+        merged["시도"].isna()
+    ]:
+        sg = merged.at[
+            idx,
+            "시군구",
+        ]
+
+        sidos = sigungu_to_sidos.get(
+            sg,
+            [],
         )
-    ]
 
-    for _, r in bad_region.iterrows():
-        qa_rows.append({
-            "관광지ID": str(r["관광지ID"]),
-            "문제": (
-                f"지역매칭실패:"
-                f"{r.get('시도','')} "
-                f"{r.get('시군구','')}"
-            ),
-            "행수": 1,
-        })
+        if len(sidos) == 1:
+            merged.at[
+                idx,
+                "시도",
+            ] = sidos[0]
+
+    valid_mask = pd.Series(
+        [
+            (
+                str(sido),
+                str(sigungu),
+            )
+            in valid_region_keys
+            for sido, sigungu
+            in zip(
+                merged["시도"],
+                merged["시군구"],
+            )
+        ],
+        index=merged.index,
+    )
+
+    invalid_region_count = int(
+        (~valid_mask).sum()
+    )
+
+    qa_rows.append(
+        {
+            "데이터구분": "관광지",
+            "검사항목": "지역매칭실패",
+            "결과": invalid_region_count,
+            "기대값": 0,
+            "상태":
+                (
+                    "정상"
+                    if invalid_region_count == 0
+                    else "제외"
+                ),
+        }
+    )
 
     merged["추천점수"] = to_numeric(
         merged["추천점수"]
     )
 
-    merged["위도"] = to_numeric(
-        merged["위도"]
-    )
-    merged["경도"] = to_numeric(
-        merged["경도"]
-    )
-
     usable = merged[
-        pd.Series(
-            valid_region_mask,
-            index=merged.index
+        valid_mask
+        & merged["위도"].between(
+            32,
+            39.5,
         )
-        & merged["위도"].between(32, 39.5)
-        & merged["경도"].between(124, 132.5)
+        & merged["경도"].between(
+            124,
+            132.5,
+        )
         & merged["추천점수"].notna()
         & ~merged["분류"].isin(
             EXCLUDED_TOUR_CATEGORIES
         )
     ].copy()
 
-    out = pd.DataFrame({
-        "place_id": usable["관광지ID"].astype(str),
-        "장소명": usable["관광지명"].astype(str),
-        "추천카테고리": "관광지",
-        "세부분류": usable["분류"].astype(str),
-        "시도": usable["시도"].astype(str),
-        "시군구": usable["시군구"].astype(str),
-        "현지인순위": to_numeric(
-            usable["현지인순위"]
-        ),
-        "외지인순위": to_numeric(
-            usable["외지인순위"]
-        ),
-        "현지인점수": to_numeric(
-            usable["현지인점수"]
-        ),
-        "외지인점수": to_numeric(
-            usable["외지인점수"]
-        ),
-        "장소추천점수": usable["추천점수"],
-        "위도": usable["위도"],
-        "경도": usable["경도"],
-        "주소": usable["주소"].fillna(""),
-        "원본구분": "관광지",
-    })
+    out = pd.DataFrame(
+        {
+            "place_id":
+                usable[
+                    "관광지ID"
+                ].astype(str),
+            "장소명":
+                usable[
+                    "관광지명"
+                ].astype(str),
+            "추천카테고리":
+                "관광지",
+            "세부분류":
+                usable[
+                    "분류"
+                ].astype(str),
+            "시도":
+                usable[
+                    "시도"
+                ].astype(str),
+            "시군구":
+                usable[
+                    "시군구"
+                ].astype(str),
+            "현지인순위":
+                to_numeric(
+                    usable[
+                        "현지인순위"
+                    ]
+                ),
+            "외지인순위":
+                to_numeric(
+                    usable[
+                        "외지인순위"
+                    ]
+                ),
+            "현지인점수":
+                to_numeric(
+                    usable[
+                        "현지인점수"
+                    ]
+                ),
+            "외지인점수":
+                to_numeric(
+                    usable[
+                        "외지인점수"
+                    ]
+                ),
+            "장소추천점수":
+                usable[
+                    "추천점수"
+                ],
+            "원본추천순위":
+                to_numeric(
+                    usable[
+                        "전국추천순위"
+                    ]
+                ),
+            "위도":
+                usable[
+                    "위도"
+                ],
+            "경도":
+                usable[
+                    "경도"
+                ],
+            "주소":
+                usable[
+                    "주소"
+                ].fillna(""),
+            "부가정보":
+                "",
+            "원본구분":
+                "관광지",
+            "지역매칭상태":
+                "원본파일기반",
+        }
+    )
 
-    qa = pd.DataFrame(
-        qa_rows,
-        columns=[
-            "관광지ID",
-            "문제",
-            "행수",
-        ]
+    qa_rows.append(
+        {
+            "데이터구분": "관광지",
+            "검사항목": "최종사용가능행",
+            "결과": len(out),
+            "기대값": len(score),
+            "상태": "정보",
+        }
+    )
+
+    qa = pd.concat(
+        [
+            pd.DataFrame(
+                qa_rows
+            ),
+            audit_raw_tour_score(
+                base_dir,
+                score,
+                geo_clean,
+            ),
+        ],
+        ignore_index=True,
     )
 
     return (
         out.reset_index(drop=True),
-        qa
+        qa,
     )
 
 
 # ============================================================
-# 6. 선택 지역 장소 후보
+# 7. 전체 장소 통합
+# ============================================================
+
+def build_all_places(
+    base_dir: Path,
+    region_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+
+    restaurant, restaurant_qa = (
+        load_restaurant_places(
+            base_dir
+        )
+    )
+
+    market, market_qa = (
+        load_market_places(
+            base_dir,
+            region_df,
+        )
+    )
+
+    tour, tour_qa = (
+        load_tour_places(
+            base_dir,
+            region_df,
+        )
+    )
+
+    all_places = pd.concat(
+        [
+            restaurant,
+            market,
+            tour,
+        ],
+        ignore_index=True,
+        sort=False,
+    )
+
+    all_places["internal_id"] = (
+        all_places["원본구분"]
+        + "_"
+        + all_places[
+            "place_id"
+        ].astype(str)
+    )
+
+    qa = pd.concat(
+        [
+            restaurant_qa,
+            market_qa,
+            tour_qa,
+        ],
+        ignore_index=True,
+        sort=False,
+    )
+
+    return (
+        all_places,
+        qa,
+    )
+
+
+
+def normalize_place_name_for_match(
+    name: str,
+) -> str:
+    """
+    시장명 중복 비교용 이름 정규화.
+    원본 장소명은 변경하지 않는다.
+    """
+    text = str(name).lower().strip()
+
+    # 괄호 안 별칭 제거
+    text = re.sub(r"\([^)]*\)", "", text)
+
+    # 공백/특수기호 제거
+    text = re.sub(
+        r"[^0-9a-z가-힣]",
+        "",
+        text,
+    )
+
+    # 시장 데이터에서 흔한 수식어 제거
+    suffixes = [
+        "임시시장",
+        "전통시장",
+        "공설시장",
+        "상설시장",
+        "종합시장",
+        "시장상점가",
+        "시장",
+    ]
+
+    for suffix in suffixes:
+        text = text.replace(
+            suffix,
+            "",
+        )
+
+    return text
+
+
+def is_same_market_place(
+    tour_row: pd.Series,
+    market_row: pd.Series,
+) -> bool:
+    """
+    관광지 분류 '시장'과 전통시장 DB가 동일 장소인지 판단.
+    이름 유사도 + 600m 이내 거리 조건을 함께 사용한다.
+    """
+    if (
+        tour_row["추천카테고리"] != "관광지"
+        or "시장" not in str(
+            tour_row["세부분류"]
+        )
+    ):
+        return False
+
+    a = normalize_place_name_for_match(
+        tour_row["장소명"]
+    )
+    b = normalize_place_name_for_match(
+        market_row["장소명"]
+    )
+
+    if not a or not b:
+        return False
+
+    ratio = difflib.SequenceMatcher(
+        None,
+        a,
+        b,
+    ).ratio()
+
+    substring_match = (
+        a in b
+        or b in a
+    )
+
+    if (
+        ratio < MARKET_NAME_SIMILARITY
+        and not substring_match
+    ):
+        return False
+
+    km = haversine_km(
+        tour_row["위도"],
+        tour_row["경도"],
+        market_row["위도"],
+        market_row["경도"],
+    )
+
+    return (
+        km
+        <= MARKET_DUPLICATE_DISTANCE_KM
+    )
+
+
+def remove_market_tour_duplicates(
+    x: pd.DataFrame,
+    selected_categories: list[str],
+) -> tuple[pd.DataFrame, list[dict]]:
+    """
+    사용자가 관광지와 전통시장을 동시에 선택한 경우,
+    관광지 데이터에 들어있는 '시장'과 전통시장 DB의 동일 장소 중복을 제거한다.
+
+    전통시장 DB를 더 구체적인 원천으로 보고 관광지 쪽 중복 행을 제거한다.
+    """
+    if not (
+        "관광지" in selected_categories
+        and "전통시장" in selected_categories
+    ):
+        return x, []
+
+    tours = x[
+        (x["추천카테고리"] == "관광지")
+        & x["세부분류"].astype(str).str.contains(
+            "시장",
+            na=False,
+        )
+    ]
+
+    markets = x[
+        x["추천카테고리"] == "전통시장"
+    ]
+
+    drop_indices = []
+    records = []
+
+    for tidx, trow in tours.iterrows():
+        for midx, mrow in markets.iterrows():
+            if is_same_market_place(
+                trow,
+                mrow,
+            ):
+                drop_indices.append(
+                    tidx
+                )
+
+                records.append(
+                    {
+                        "제거된관광지":
+                            trow["장소명"],
+                        "유지된전통시장":
+                            mrow["장소명"],
+                        "거리km":
+                            round(
+                                haversine_km(
+                                    trow["위도"],
+                                    trow["경도"],
+                                    mrow["위도"],
+                                    mrow["경도"],
+                                ),
+                                3,
+                            ),
+                    }
+                )
+                break
+
+    if drop_indices:
+        x = x.drop(
+            index=drop_indices
+        )
+
+    return (
+        x.reset_index(
+            drop=True
+        ),
+        records,
+    )
+
+
+def general_tour_type_adjustment(
+    row: pd.Series,
+) -> float:
+    """
+    일반 관광 기본 모드의 세부분류 보정.
+
+    자연/문화/생태/역사/경관 계열은 소폭 우대,
+    레저/스포츠/웰니스/골프/스파 계열은 사용자의 명시적 테마 선택이
+    없는 기본 일정에서 과도하게 선택되지 않도록 감점한다.
+
+    원래 관광지 추천점수는 변경하지 않는다.
+    """
+    if row["추천카테고리"] != "관광지":
+        return 0.0
+
+    text = (
+        str(row["세부분류"])
+        + " "
+        + str(row["장소명"])
+    ).lower()
+
+    special = [
+        "레저",
+        "스포츠",
+        "웰니스",
+        "골프",
+        "스파",
+    ]
+
+    general = [
+        "자연",
+        "생태",
+        "문화",
+        "역사",
+        "경관",
+        "공원",
+        "해수욕",
+        "항",
+        "포구",
+        "전망",
+        "박물",
+        "미술",
+    ]
+
+    if any(
+        k in text
+        for k in special
+    ):
+        return (
+            GENERAL_TOUR_SPECIAL_PENALTY
+        )
+
+    if any(
+        k in text
+        for k in general
+    ):
+        return (
+            GENERAL_TOUR_POSITIVE_BONUS
+        )
+
+    return 0.0
+
+
+def add_route_selection_score(
+    candidates: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    서로 다른 카테고리의 원점수 척도가 다르므로
+    경로 최적화용 공통점수를 별도로 생성한다.
+
+    - 원래 '장소추천점수'는 그대로 보존
+    - 카테고리내순위 1위 = 100
+    - 이후 순위마다 5점 감소, 최저 55
+    - 관광지에만 일반 관광 유형 보정 적용
+    """
+    x = candidates.copy()
+
+    x["관광유형보정점수"] = x.apply(
+        general_tour_type_adjustment,
+        axis=1,
+    )
+
+    x["경로선택기본점수"] = (
+        100.0
+        - (
+            x["카테고리내순위"]
+            - 1
+        )
+        * ROUTE_RANK_STEP
+    ).clip(
+        lower=ROUTE_SCORE_FLOOR,
+        upper=100.0,
+    )
+
+    x["경로선택점수"] = (
+        x["경로선택기본점수"]
+        + x["관광유형보정점수"]
+    ).clip(
+        lower=0.0,
+        upper=100.0,
+    )
+
+    return x
+
+
+# ============================================================
+# 8. 지역별 장소 후보
 # ============================================================
 
 def get_place_candidates(
@@ -841,37 +2404,95 @@ def get_place_candidates(
     selected_sido: str,
     selected_sigungu: str,
     selected_categories: list[str],
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, list[dict]]:
 
-    invalid = set(selected_categories) - VALID_CATEGORIES
+    invalid = (
+        set(selected_categories)
+        - VALID_CATEGORIES
+    )
 
     if invalid:
         raise ValueError(
-            f"지원하지 않는 카테고리: {sorted(invalid)}"
+            "지원하지 않는 카테고리: "
+            f"{sorted(invalid)}"
         )
 
     x = all_places[
-        (all_places["시도"] == selected_sido)
+        (
+            all_places["시도"]
+            == selected_sido
+        )
         & (
             all_places["시군구"]
             == selected_sigungu
         )
         & all_places[
             "추천카테고리"
-        ].isin(selected_categories)
+        ].isin(
+            selected_categories
+        )
     ].copy()
 
     if x.empty:
         raise ValueError(
-            f"{selected_sido} {selected_sigungu}에서 "
-            f"{selected_categories} 후보를 찾지 못했습니다."
+            f"{selected_sido} "
+            f"{selected_sigungu}에서 "
+            f"{selected_categories} "
+            "후보를 찾지 못했습니다."
         )
 
-    # 카테고리 안에서 기존 장소추천점수 기준 순위
+    # 전통시장 카테고리를 별도로 선택한 경우,
+    # 관광지 데이터의 '시장' 분류는 전통시장 DB와 의미가 겹치므로 제외한다.
+    # 전통시장 DB를 시장 카테고리의 단일 기준(source of truth)으로 사용한다.
+    semantic_market_records = []
+
+    if "전통시장" in selected_categories:
+        semantic_market_mask = (
+            (x["추천카테고리"] == "관광지")
+            & x["세부분류"].astype(str).str.contains(
+                "시장",
+                na=False,
+            )
+        )
+
+        for _, row in x[
+            semantic_market_mask
+        ].iterrows():
+            semantic_market_records.append(
+                {
+                    "제거된관광지":
+                        row["장소명"],
+                    "유지된전통시장":
+                        "전통시장 DB 사용",
+                    "거리km":
+                        None,
+                    "제거사유":
+                        "전통시장 카테고리 선택 시 관광지 시장분류 의미중복 제거",
+                }
+            )
+
+        x = x[
+            ~semantic_market_mask
+        ].copy()
+
+    # 남아있는 관광지 시장과 전통시장 간 실제 동일 장소 중복도 추가 제거
+    x, exact_duplicate_records = (
+        remove_market_tour_duplicates(
+            x,
+            selected_categories,
+        )
+    )
+
+    duplicate_records = (
+        semantic_market_records
+        + exact_duplicate_records
+    )
+
+    # 원래 점수는 해당 카테고리 내부 후보 선정에만 사용
     x["카테고리내순위"] = (
-        x.groupby("추천카테고리")[
-            "장소추천점수"
-        ]
+        x.groupby(
+            "추천카테고리"
+        )["장소추천점수"]
         .rank(
             method="first",
             ascending=False,
@@ -879,34 +2500,32 @@ def get_place_candidates(
         .astype(int)
     )
 
-    # 경로 탐색량 제한:
-    # 각 카테고리 TOP N
     x = x[
         x["카테고리내순위"]
         <= TOP_CANDIDATES_PER_CATEGORY
     ].copy()
 
-    return x.sort_values(
-        [
-            "추천카테고리",
-            "카테고리내순위",
-        ]
-    ).reset_index(drop=True)
+    # 실제 경로 최적화에는 공통 척도의 별도 점수를 사용
+    x = add_route_selection_score(
+        x
+    )
 
+    return (
+        x.sort_values(
+            [
+                "추천카테고리",
+                "카테고리내순위",
+            ]
+        ).reset_index(
+            drop=True
+        ),
+        duplicate_records,
+    )
 
 
 def infer_region_center(
     candidates: pd.DataFrame,
 ) -> tuple[float, float]:
-    """
-    출발지 미입력 시 선택 지역 후보 장소들의 중앙값 좌표를
-    임시 지역 중심점으로 사용한다.
-    평균보다 이상치에 덜 민감한 median 사용.
-    """
-    if candidates.empty:
-        raise ValueError(
-            "지역 중심점을 계산할 후보 장소가 없습니다."
-        )
 
     lat = float(
         pd.to_numeric(
@@ -922,79 +2541,19 @@ def infer_region_center(
         ).median()
     )
 
-    if math.isnan(lat) or math.isnan(lon):
+    if (
+        math.isnan(lat)
+        or math.isnan(lon)
+    ):
         raise ValueError(
-            "지역 중심점 계산에 실패했습니다."
+            "지역 중심점 계산 실패"
         )
 
     return lat, lon
 
 
-def near_duplicate_tourist_stop(
-    new_idx: int,
-    route: list[int],
-    candidates: pd.DataFrame,
-    threshold_km: float = NEARBY_TOUR_CLUSTER_KM,
-) -> bool:
-    """
-    이미 경로에 들어간 관광지와 500m 이내이고,
-    새 장소도 관광지라면 같은 관광권역 중복으로 판단.
-    """
-    new_row = candidates.loc[new_idx]
-
-    if new_row["추천카테고리"] != "관광지":
-        return False
-
-    for idx in route:
-        old_row = candidates.loc[idx]
-
-        if old_row["추천카테고리"] != "관광지":
-            continue
-
-        km = haversine_km(
-            old_row["위도"],
-            old_row["경도"],
-            new_row["위도"],
-            new_row["경도"],
-        )
-
-        if km <= threshold_km:
-            return True
-
-    return False
-
-
-def tourist_subcategory_diversity_score(
-    route: list[int],
-    candidates: pd.DataFrame,
-) -> float:
-    """
-    관광지 세부분류 다양성을 평가.
-    같은 세부분류가 반복될수록 감점한다.
-    """
-    subs = []
-
-    for idx in route:
-        row = candidates.loc[idx]
-
-        if row["추천카테고리"] == "관광지":
-            subs.append(
-                str(row["세부분류"])
-            )
-
-    if not subs:
-        return 0.0
-
-    repeats = len(subs) - len(set(subs))
-
-    return -(
-        repeats
-        * SAME_TOUR_SUBCATEGORY_PENALTY
-    )
-
-
 # ============================================================
-# 7. 이동시간
+# 9. 이동시간
 # ============================================================
 
 class TravelTimeProvider:
@@ -1009,8 +2568,12 @@ class TravelTimeProvider:
         cache_file: Path,
         api_key: str = "",
     ):
-        self.api_key = api_key
-        self.cache_file = cache_file
+        self.api_key = (
+            api_key.strip()
+        )
+        self.cache_file = (
+            cache_file
+        )
 
         if cache_file.exists():
             try:
@@ -1055,33 +2618,43 @@ class TravelTimeProvider:
         lat2,
         lon2,
     ):
-        straight_km = haversine_km(
-            lat1,
-            lon1,
-            lat2,
-            lon2,
+        straight_km = (
+            haversine_km(
+                lat1,
+                lon1,
+                lat2,
+                lon2,
+            )
         )
 
-        # 실제 도로는 직선거리보다 길다는 점을 반영
-        road_km = straight_km * 1.25
+        road_km = (
+            straight_km
+            * 1.25
+        )
 
-        # 관광지/도심 혼합 평균속도 30 km/h
-        # 주차·교차로 등을 고려한 3분 추가
         minutes = (
-            road_km / 30.0 * 60.0
+            road_km
+            / 30.0
+            * 60.0
             + 3.0
         )
 
         return {
-            "distance_km": round(
-                road_km,
-                3
-            ),
-            "minutes": round(
-                max(2.0, minutes),
-                2
-            ),
-            "source": "거리기반추정",
+            "distance_km":
+                round(
+                    road_km,
+                    3,
+                ),
+            "minutes":
+                round(
+                    max(
+                        2.0,
+                        minutes,
+                    ),
+                    2,
+                ),
+            "source":
+                "거리기반추정",
         }
 
     def get(
@@ -1103,13 +2676,18 @@ class TravelTimeProvider:
 
         result = None
 
-        if self.api_key and requests is not None:
+        if (
+            self.api_key
+            and requests
+            is not None
+        ):
             try:
                 response = requests.get(
                     self.KAKAO_URL,
                     headers={
                         "Authorization":
-                            f"KakaoAK {self.api_key}",
+                            f"KakaoAK "
+                            f"{self.api_key}",
                         "Content-Type":
                             "application/json",
                     },
@@ -1127,32 +2705,42 @@ class TravelTimeProvider:
                 )
 
                 response.raise_for_status()
-                payload = response.json()
+                payload = (
+                    response.json()
+                )
 
                 routes = payload.get(
                     "routes",
-                    []
+                    [],
                 )
 
                 if routes:
-                    summary = routes[0].get(
-                        "summary",
-                        {}
+                    summary = (
+                        routes[0]
+                        .get(
+                            "summary",
+                            {},
+                        )
                     )
 
                     if (
-                        "distance" in summary
-                        and "duration" in summary
+                        "distance"
+                        in summary
+                        and "duration"
+                        in summary
                     ):
                         result = {
                             "distance_km":
                                 summary[
                                     "distance"
-                                ] / 1000.0,
+                                ]
+                                / 1000.0,
                             "minutes":
                                 summary[
                                     "duration"
-                                ] / 1000.0 / 60.0,
+                                ]
+                                / 1000.0
+                                / 60.0,
                             "source":
                                 "Kakao자동차",
                         }
@@ -1174,117 +2762,140 @@ class TravelTimeProvider:
 
 
 # ============================================================
-# 8. 경로 탐색
+# 10. 시간/경로 평가
 # ============================================================
 
-def parse_hhmm(value: str) -> int:
-    """HH:MM 문자열을 0시 기준 분으로 변환."""
-    try:
-        hh, mm = map(int, str(value).split(":"))
-    except Exception as e:
-        raise ValueError(
-            f"시간 형식은 HH:MM 이어야 합니다: {value}"
-        ) from e
+def parse_hhmm(
+    value: str,
+) -> int:
 
-    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+    hh, mm = map(
+        int,
+        str(value).split(":"),
+    )
+
+    if not (
+        0 <= hh <= 23
+        and 0 <= mm <= 59
+    ):
         raise ValueError(
-            f"올바르지 않은 시간입니다: {value}"
+            f"잘못된 시간: {value}"
         )
 
-    return hh * 60 + mm
+    return (
+        hh * 60
+        + mm
+    )
 
 
-def minutes_to_hhmm(minutes: float) -> str:
-    """분 값을 HH:MM으로 표현. 날짜를 넘으면 +1일 표시."""
-    total = int(round(minutes))
-    day = total // (24 * 60)
-    total = total % (24 * 60)
+def minutes_to_hhmm(
+    minutes: float,
+) -> str:
+
+    total = int(
+        round(minutes)
+    )
+
+    day = (
+        total
+        // (24 * 60)
+    )
+
+    total %= (
+        24 * 60
+    )
+
     hh = total // 60
     mm = total % 60
 
     if day:
-        return f"+{day}일 {hh:02d}:{mm:02d}"
+        return (
+            f"+{day}일 "
+            f"{hh:02d}:"
+            f"{mm:02d}"
+        )
 
-    return f"{hh:02d}:{mm:02d}"
-
-
-def in_window(value: float, window: tuple[int, int]) -> bool:
-    return window[0] <= value <= window[1]
-
-
-def category_quota_bonus(
-    route_categories: list[str],
-    selected_categories: list[str],
-) -> float:
-    """
-    사용자가 선택한 카테고리를 실제 경로가 얼마나 충족하는지 평가.
-    카테고리 하나를 처음 포함할 때 보너스를 크게 부여한다.
-    """
-    covered = len(
-        set(route_categories)
-        & set(selected_categories)
+    return (
+        f"{hh:02d}:"
+        f"{mm:02d}"
     )
 
-    return covered * 20.0
 
-
-def get_category_limit(
-    category: str,
-    selected_categories: list[str],
-) -> int:
-    """
-    여러 카테고리 선택 시:
-    - 맛집 1곳
-    - 카페/베이커리 1곳
-    - 관광지는 나머지 일정 구성
-
-    단, 사용자가 한 종류만 골랐다면 해당 제한을 적용하지 않는다.
-    """
-    if len(set(selected_categories)) <= 1:
-        return 99
-
-    return MULTI_CATEGORY_MAX_VISITS.get(
-        category,
-        99,
+def in_window(
+    value: float,
+    window: tuple[int, int],
+) -> bool:
+    return (
+        window[0]
+        <= value
+        <= window[1]
     )
 
 
 def evaluate_time_fit(
     category: str,
-    activity_start_minute: float,
+    arrival: float,
 ) -> float:
-    """
-    해당 장소를 그 시각에 방문하는 것이 자연스러운지 점수화.
-    장소 원래 추천점수는 건드리지 않고 '경로 순서' 평가에만 사용한다.
-    """
+
     if category == "맛집":
-        if in_window(activity_start_minute, LUNCH_WINDOW):
+
+        if in_window(
+            arrival,
+            LUNCH_WINDOW,
+        ):
             return 28.0
-        if in_window(activity_start_minute, DINNER_WINDOW):
+
+        if in_window(
+            arrival,
+            DINNER_WINDOW,
+        ):
             return 24.0
 
-        # 오전 너무 이른 식당 방문은 강하게 감점
-        if activity_start_minute < 11 * 60:
+        if arrival < 11 * 60:
             return -32.0
 
-        # 점심과 저녁 사이에는 약한 감점
-        if 14 * 60 < activity_start_minute < 17 * 60 + 30:
+        if (
+            14 * 60
+            < arrival
+            < 17 * 60 + 30
+        ):
             return -12.0
 
         return -8.0
 
-    if category == "카페/베이커리":
-        if in_window(activity_start_minute, CAFE_WINDOW):
+    if (
+        category
+        == "카페/베이커리"
+    ):
+
+        if in_window(
+            arrival,
+            CAFE_WINDOW,
+        ):
             return 18.0
 
-        if activity_start_minute < 11 * 60:
+        if arrival < 11 * 60:
             return -12.0
 
         return 4.0
 
+    if category == "전통시장":
+
+        if in_window(
+            arrival,
+            MARKET_WINDOW,
+        ):
+            return 10.0
+
+        return -8.0
+
     if category == "관광지":
-        # 오전~오후 관광을 기본적으로 선호
-        if 9 * 60 <= activity_start_minute <= 17 * 60 + 30:
+
+        if (
+            9 * 60
+            <= arrival
+            <= 17 * 60 + 30
+        ):
             return 8.0
 
         return -5.0
@@ -1292,25 +2903,247 @@ def evaluate_time_fit(
     return 0.0
 
 
+def category_quota_bonus(
+    route_categories: list[str],
+    selected_categories: list[str],
+) -> float:
+
+    covered = len(
+        set(route_categories)
+        & set(selected_categories)
+    )
+
+    return (
+        covered
+        * 20.0
+    )
+
+
+def get_category_limit(
+    category: str,
+    selected_categories: list[str],
+) -> int:
+
+    if (
+        len(
+            set(
+                selected_categories
+            )
+        )
+        <= 1
+    ):
+        return 99
+
+    return (
+        MULTI_CATEGORY_MAX_VISITS
+        .get(
+            category,
+            99,
+        )
+    )
+
+
+def violates_category_limit(
+    route: list[int],
+    candidates: pd.DataFrame,
+    selected_categories: list[str],
+) -> bool:
+
+    categories = [
+        candidates.loc[
+            idx,
+            "추천카테고리",
+        ]
+        for idx in route
+    ]
+
+    for category in set(
+        categories
+    ):
+        if (
+            categories.count(
+                category
+            )
+            > get_category_limit(
+                category,
+                selected_categories,
+            )
+        ):
+            return True
+
+    return False
+
+
+def near_duplicate_tourist_stop(
+    new_idx: int,
+    route: list[int],
+    candidates: pd.DataFrame,
+    threshold_km: float
+    = NEARBY_TOUR_CLUSTER_KM,
+) -> bool:
+
+    new_row = candidates.loc[
+        new_idx
+    ]
+
+    if (
+        new_row["추천카테고리"]
+        != "관광지"
+    ):
+        return False
+
+    for idx in route:
+
+        old_row = candidates.loc[
+            idx
+        ]
+
+        if (
+            old_row[
+                "추천카테고리"
+            ]
+            != "관광지"
+        ):
+            continue
+
+        km = haversine_km(
+            old_row["위도"],
+            old_row["경도"],
+            new_row["위도"],
+            new_row["경도"],
+        )
+
+        if km <= threshold_km:
+            return True
+
+    return False
+
+
+def tourist_subcategory_diversity_score(
+    route: list[int],
+    candidates: pd.DataFrame,
+) -> float:
+
+    subs = []
+
+    for idx in route:
+        row = candidates.loc[
+            idx
+        ]
+
+        if (
+            row[
+                "추천카테고리"
+            ]
+            == "관광지"
+        ):
+            subs.append(
+                str(
+                    row[
+                        "세부분류"
+                    ]
+                )
+            )
+
+    repeats = (
+        len(subs)
+        - len(
+            set(subs)
+        )
+    )
+
+    return (
+        -repeats
+        * SAME_TOUR_SUBCATEGORY_PENALTY
+    )
+
+
+def natural_flow_score(
+    schedule: list[dict],
+) -> float:
+
+    if not schedule:
+        return 0.0
+
+    score = sum(
+        stop[
+            "time_fit_score"
+        ]
+        for stop in schedule
+    )
+
+    for prev, cur in zip(
+        schedule,
+        schedule[1:],
+    ):
+        a = prev["category"]
+        b = cur["category"]
+
+        if a == b:
+
+            if b == "맛집":
+                score -= 100.0
+
+            elif (
+                b
+                == "카페/베이커리"
+            ):
+                score -= 60.0
+
+            elif b == "전통시장":
+                score -= 50.0
+
+            else:
+                score -= 10.0
+
+        else:
+            score += 5.0
+
+            if (
+                a == "관광지"
+                and b
+                in {
+                    "맛집",
+                    "카페/베이커리",
+                    "전통시장",
+                }
+            ):
+                score += 4.0
+
+            if (
+                a == "맛집"
+                and b
+                in {
+                    "관광지",
+                    "카페/베이커리",
+                    "전통시장",
+                }
+            ):
+                score += 4.0
+
+    return score
+
+
 def simulate_route(
     route: list[int],
     candidates: pd.DataFrame,
     provider: TravelTimeProvider,
-    start_lat: Optional[float],
-    start_lon: Optional[float],
+    start_lat: float,
+    start_lon: float,
     start_minute: int,
-) -> tuple[list[dict], float, float, float]:
-    """
-    경로를 실제 시간 순서대로 시뮬레이션한다.
+) -> tuple[
+    list[dict],
+    float,
+    float,
+    float,
+]:
 
-    반환:
-    - 각 장소 일정
-    - 장소추천점수 합
-    - 총 이동시간(분)
-    - 총 이동거리(km)
-    """
     schedule = []
-    current_minute = float(start_minute)
+
+    current_minute = float(
+        start_minute
+    )
+
     prev_lat = start_lat
     prev_lon = start_lon
 
@@ -1319,54 +3152,92 @@ def simulate_route(
     total_distance_km = 0.0
 
     for idx in route:
-        row = candidates.loc[idx]
 
-        if (
-            prev_lat is None
-            or prev_lon is None
-        ):
-            travel = {
-                "minutes": 0.0,
-                "distance_km": 0.0,
-                "source": "첫장소",
-            }
-        else:
-            travel = provider.get(
-                prev_lat,
-                prev_lon,
-                row["위도"],
-                row["경도"],
-            )
+        row = candidates.loc[
+            idx
+        ]
 
-        travel_min = float(travel["minutes"])
-        distance_km = float(travel["distance_km"])
-
-        arrival = current_minute + travel_min
-        category = row["추천카테고리"]
-        stay = STAY_MINUTES[category]
-        depart = arrival + stay
-
-        schedule.append({
-            "idx": idx,
-            "category": category,
-            "arrival": arrival,
-            "depart": depart,
-            "stay": stay,
-            "travel_min": travel_min,
-            "distance_km": distance_km,
-            "travel_source": travel["source"],
-            "time_fit_score": evaluate_time_fit(
-                category,
-                arrival,
-            ),
-        })
-
-        current_minute = depart
-        total_place_score += float(
-            row["장소추천점수"]
+        travel = provider.get(
+            prev_lat,
+            prev_lon,
+            row["위도"],
+            row["경도"],
         )
-        total_travel_min += travel_min
-        total_distance_km += distance_km
+
+        travel_min = float(
+            travel["minutes"]
+        )
+
+        distance_km = float(
+            travel["distance_km"]
+        )
+
+        arrival = (
+            current_minute
+            + travel_min
+        )
+
+        category = (
+            row[
+                "추천카테고리"
+            ]
+        )
+
+        stay = (
+            STAY_MINUTES[
+                category
+            ]
+        )
+
+        depart = (
+            arrival
+            + stay
+        )
+
+        schedule.append(
+            {
+                "idx": idx,
+                "category":
+                    category,
+                "arrival":
+                    arrival,
+                "depart":
+                    depart,
+                "stay":
+                    stay,
+                "travel_min":
+                    travel_min,
+                "distance_km":
+                    distance_km,
+                "travel_source":
+                    travel[
+                        "source"
+                    ],
+                "time_fit_score":
+                    evaluate_time_fit(
+                        category,
+                        arrival,
+                    ),
+            }
+        )
+
+        current_minute = (
+            depart
+        )
+
+        total_place_score += float(
+            row[
+                "경로선택점수"
+            ]
+        )
+
+        total_travel_min += (
+            travel_min
+        )
+
+        total_distance_km += (
+            distance_km
+        )
 
         prev_lat = row["위도"]
         prev_lon = row["경도"]
@@ -1383,100 +3254,36 @@ def route_total_minutes(
     route: list[int],
     candidates: pd.DataFrame,
     provider: TravelTimeProvider,
-    start_lat: Optional[float],
-    start_lon: Optional[float],
+    start_lat: float,
+    start_lon: float,
     start_minute: int,
 ) -> float:
-    schedule, _, _, _ = simulate_route(
-        route,
-        candidates,
-        provider,
-        start_lat,
-        start_lon,
-        start_minute,
+
+    schedule, _, _, _ = (
+        simulate_route(
+            route,
+            candidates,
+            provider,
+            start_lat,
+            start_lon,
+            start_minute,
+        )
     )
 
     if not schedule:
         return 0.0
 
     return (
-        schedule[-1]["depart"]
+        schedule[-1][
+            "depart"
+        ]
         - start_minute
     )
 
 
-def natural_flow_score(
-    schedule: list[dict],
-) -> float:
-    """
-    카테고리 흐름 평가.
-
-    핵심:
-    - 맛집 연속 방문은 사실상 선택되지 않도록 매우 큰 감점
-    - 카페 연속 방문도 큰 감점
-    - 같은 카테고리 연속 반복은 일반적으로 감점
-    - 관광지 → 맛집/카페, 맛집 → 관광지/카페 같은 전환에는 소폭 보너스
-    """
-    if not schedule:
-        return 0.0
-
-    score = sum(
-        stop["time_fit_score"]
-        for stop in schedule
-    )
-
-    for prev, cur in zip(
-        schedule,
-        schedule[1:],
-    ):
-        a = prev["category"]
-        b = cur["category"]
-
-        if a == b:
-            if b == "맛집":
-                score -= 100.0
-            elif b == "카페/베이커리":
-                score -= 60.0
-            else:
-                score -= 10.0
-        else:
-            # 서로 다른 성격의 장소로 이동하면 소폭 보너스
-            score += 5.0
-
-            if (
-                a == "관광지"
-                and b in {"맛집", "카페/베이커리"}
-            ):
-                score += 4.0
-
-            if (
-                a == "맛집"
-                and b in {"관광지", "카페/베이커리"}
-            ):
-                score += 4.0
-
-    return score
-
-
-def violates_category_limit(
-    route: list[int],
-    candidates: pd.DataFrame,
-    selected_categories: list[str],
-) -> bool:
-    categories = [
-        candidates.loc[i]["추천카테고리"]
-        for i in route
-    ]
-
-    for category in set(categories):
-        if categories.count(category) > get_category_limit(
-            category,
-            selected_categories,
-        ):
-            return True
-
-    return False
-
+# ============================================================
+# 11. 경로 최적화
+# ============================================================
 
 def optimize_route(
     candidates: pd.DataFrame,
@@ -1485,70 +3292,93 @@ def optimize_route(
     max_stops: int,
     target_stops: int,
     provider: TravelTimeProvider,
-    start_lat: Optional[float] = None,
-    start_lon: Optional[float] = None,
-    start_time: str = DEFAULT_START_TIME,
+    start_lat: float,
+    start_lon: float,
+    start_time: str
+    = DEFAULT_START_TIME,
 ) -> list[int]:
 
-    candidates = candidates.reset_index(
-        drop=True
+    candidates = (
+        candidates
+        .reset_index(
+            drop=True
+        )
     )
 
     if candidates.empty:
         return []
 
-    start_minute = parse_hhmm(
-        start_time
+    start_minute = (
+        parse_hhmm(
+            start_time
+        )
     )
 
-    # 상태 = (route, objective)
     beam = [
         ([], 0.0)
     ]
 
     finished = []
 
-    for _ in range(max_stops):
+    for _ in range(
+        max_stops
+    ):
 
         next_states = []
 
         for route, _ in beam:
-            used = set(route)
 
-            for idx, row in candidates.iterrows():
+            used = set(
+                route
+            )
+
+            for idx, _row in (
+                candidates.iterrows()
+            ):
+
                 idx = int(idx)
 
                 if idx in used:
                     continue
 
-                # 동일 관광권역의 관광지를 연달아 여러 개 넣는 것 방지
-                if near_duplicate_tourist_stop(
-                    idx,
-                    route,
-                    candidates,
+                if (
+                    near_duplicate_tourist_stop(
+                        idx,
+                        route,
+                        candidates,
+                    )
                 ):
                     continue
 
-                new_route = route + [idx]
-
-                # 여러 카테고리 선택 시 맛집/카페 과다 포함 방지
-                if violates_category_limit(
-                    new_route,
-                    candidates,
-                    selected_categories,
-                ):
-                    continue
-
-                total_minutes = route_total_minutes(
-                    new_route,
-                    candidates,
-                    provider,
-                    start_lat,
-                    start_lon,
-                    start_minute,
+                new_route = (
+                    route
+                    + [idx]
                 )
 
-                if total_minutes > budget_min:
+                if (
+                    violates_category_limit(
+                        new_route,
+                        candidates,
+                        selected_categories,
+                    )
+                ):
+                    continue
+
+                total_minutes = (
+                    route_total_minutes(
+                        new_route,
+                        candidates,
+                        provider,
+                        start_lat,
+                        start_lon,
+                        start_minute,
+                    )
+                )
+
+                if (
+                    total_minutes
+                    > budget_min
+                ):
                     continue
 
                 (
@@ -1566,45 +3396,52 @@ def optimize_route(
                 )
 
                 categories = [
-                    stop["category"]
-                    for stop in schedule
+                    x["category"]
+                    for x in schedule
                 ]
 
-                diversity_bonus = (
+                coverage_bonus = (
                     category_quota_bonus(
                         categories,
                         selected_categories,
                     )
                 )
 
-                flow_score = natural_flow_score(
-                    schedule
+                flow_score = (
+                    natural_flow_score(
+                        schedule
+                    )
                 )
 
-                tour_diversity_score = (
+                tour_diversity = (
                     tourist_subcategory_diversity_score(
                         new_route,
                         candidates,
                     )
                 )
 
-                # 이동이 짧을수록 좋지만, 장소 점수/자연스러운 일정도 함께 고려
                 travel_penalty = (
-                    travel_min * 0.55
+                    travel_min
+                    * 0.55
                 )
 
-                # 사용자가 선택한 카테고리를 빠르게 충족하도록 보너스
-                missing_category_count = len(
-                    set(selected_categories)
+                missing_count = len(
+                    set(
+                        selected_categories
+                    )
                     - set(categories)
                 )
+
                 missing_penalty = (
-                    missing_category_count * 12.0
+                    missing_count
+                    * 12.0
                 )
 
                 stop_bonus = (
                     min(
-                        len(new_route),
+                        len(
+                            new_route
+                        ),
                         target_stops,
                     )
                     * 2.5
@@ -1612,9 +3449,9 @@ def optimize_route(
 
                 objective = (
                     place_score
-                    + diversity_bonus
+                    + coverage_bonus
                     + flow_score
-                    + tour_diversity_score
+                    + tour_diversity
                     + stop_bonus
                     - travel_penalty
                     - missing_penalty
@@ -1625,22 +3462,30 @@ def optimize_route(
                     objective,
                 )
 
-                next_states.append(state)
-                finished.append(state)
+                next_states.append(
+                    state
+                )
+
+                finished.append(
+                    state
+                )
 
         if not next_states:
             break
 
         next_states.sort(
-            key=lambda x: x[1],
+            key=lambda x:
+                x[1],
             reverse=True,
         )
 
-        # 같은 방문 집합 + 마지막 장소가 동일한 상태는 중복 제거
         unique = []
         seen = set()
 
-        for route, score in next_states:
+        for route, score in (
+            next_states
+        ):
+
             signature = (
                 frozenset(route),
                 route[-1],
@@ -1649,12 +3494,21 @@ def optimize_route(
             if signature in seen:
                 continue
 
-            seen.add(signature)
-            unique.append(
-                (route, score)
+            seen.add(
+                signature
             )
 
-            if len(unique) >= BEAM_WIDTH:
+            unique.append(
+                (
+                    route,
+                    score,
+                )
+            )
+
+            if (
+                len(unique)
+                >= BEAM_WIDTH
+            ):
                 break
 
         beam = unique
@@ -1662,25 +3516,26 @@ def optimize_route(
     if not finished:
         return []
 
-    def final_key(state):
+    def final_key(
+        state,
+    ):
         route, objective = state
 
-        categories = [
-            candidates.loc[i][
-                "추천카테고리"
+        categories = {
+            candidates.loc[
+                idx,
+                "추천카테고리",
             ]
-            for i in route
-        ]
+            for idx in route
+        }
 
         coverage = len(
-            set(categories)
-            & set(selected_categories)
+            categories
+            & set(
+                selected_categories
+            )
         )
 
-        # 최종 선택 우선순위:
-        # 1) 선택 카테고리 충족
-        # 2) 목표 방문지 수 충족
-        # 3) 자연스러운 일정 + 장소점수 + 이동효율
         return (
             coverage,
             min(
@@ -1699,7 +3554,7 @@ def optimize_route(
 
 
 # ============================================================
-# 9. 경로 상세 생성
+# 12. 최종 경로 상세
 # ============================================================
 
 def build_route_detail(
@@ -1707,13 +3562,16 @@ def build_route_detail(
     candidates: pd.DataFrame,
     provider: TravelTimeProvider,
     day: int,
-    start_lat: Optional[float],
-    start_lon: Optional[float],
-    start_time: str = DEFAULT_START_TIME,
+    start_lat: float,
+    start_lon: float,
+    start_time: str
+    = DEFAULT_START_TIME,
 ) -> pd.DataFrame:
 
-    start_minute = parse_hhmm(
-        start_time
+    start_minute = (
+        parse_hhmm(
+            start_time
+        )
     )
 
     (
@@ -1736,105 +3594,178 @@ def build_route_detail(
         schedule,
         start=1,
     ):
+
         idx = stop["idx"]
-        row = candidates.loc[idx]
+        row = candidates.loc[
+            idx
+        ]
 
-        rows.append({
-            "day": day,
-            "order": order,
-            "도착예정":
-                minutes_to_hhmm(
-                    stop["arrival"]
-                ),
-            "출발예정":
-                minutes_to_hhmm(
-                    stop["depart"]
-                ),
-            "place_id":
-                row["place_id"],
-            "장소명":
-                row["장소명"],
-            "카테고리":
-                row["추천카테고리"],
-            "세부분류":
-                row["세부분류"],
-            "시도":
-                row["시도"],
-            "시군구":
-                row["시군구"],
-            "장소추천점수":
-                round(
-                    float(
-                        row[
-                            "장소추천점수"
-                        ]
-                    ),
-                    2,
-                ),
-            "현지인순위":
-                row["현지인순위"],
-            "외지인순위":
-                row["외지인순위"],
-            "시간대적합점수":
-                round(
-                    float(
+        rows.append(
+            {
+                "day":
+                    day,
+                "order":
+                    order,
+                "도착예정":
+                    minutes_to_hhmm(
                         stop[
-                            "time_fit_score"
+                            "arrival"
                         ]
                     ),
-                    1,
-                ),
-            "이전장소에서_이동분":
-                round(
-                    float(
-                        stop["travel_min"]
+                "출발예정":
+                    minutes_to_hhmm(
+                        stop[
+                            "depart"
+                        ]
                     ),
-                    1,
-                ),
-            "이전장소에서_이동km":
-                round(
-                    float(
-                        stop["distance_km"]
+                "place_id":
+                    row[
+                        "place_id"
+                    ],
+                "장소명":
+                    row[
+                        "장소명"
+                    ],
+                "카테고리":
+                    row[
+                        "추천카테고리"
+                    ],
+                "세부분류":
+                    row[
+                        "세부분류"
+                    ],
+                "시도":
+                    row[
+                        "시도"
+                    ],
+                "시군구":
+                    row[
+                        "시군구"
+                    ],
+                "장소추천점수":
+                    round(
+                        float(
+                            row[
+                                "장소추천점수"
+                            ]
+                        ),
+                        2,
                     ),
-                    2,
-                ),
-            "이동시간출처":
-                stop["travel_source"],
-            "체류시간분":
-                stop["stay"],
-            "누적소요시간분":
-                round(
-                    stop["depart"]
-                    - start_minute,
-                    1,
-                ),
-            "위도":
-                row["위도"],
-            "경도":
-                row["경도"],
-            "주소":
-                row["주소"],
-            "원본구분":
-                row["원본구분"],
-        })
+                "경로선택점수":
+                    round(
+                        float(
+                            row[
+                                "경로선택점수"
+                            ]
+                        ),
+                        2,
+                    ),
+                "관광유형보정점수":
+                    round(
+                        float(
+                            row[
+                                "관광유형보정점수"
+                            ]
+                        ),
+                        2,
+                    ),
+                "원본추천순위":
+                    row[
+                        "원본추천순위"
+                    ],
+                "현지인순위":
+                    row[
+                        "현지인순위"
+                    ],
+                "외지인순위":
+                    row[
+                        "외지인순위"
+                    ],
+                "시간대적합점수":
+                    round(
+                        float(
+                            stop[
+                                "time_fit_score"
+                            ]
+                        ),
+                        1,
+                    ),
+                "이전장소에서_이동분":
+                    round(
+                        float(
+                            stop[
+                                "travel_min"
+                            ]
+                        ),
+                        1,
+                    ),
+                "이전장소에서_이동km":
+                    round(
+                        float(
+                            stop[
+                                "distance_km"
+                            ]
+                        ),
+                        2,
+                    ),
+                "이동시간출처":
+                    stop[
+                        "travel_source"
+                    ],
+                "체류시간분":
+                    stop[
+                        "stay"
+                    ],
+                "누적소요시간분":
+                    round(
+                        stop[
+                            "depart"
+                        ]
+                        - start_minute,
+                        1,
+                    ),
+                "위도":
+                    row[
+                        "위도"
+                    ],
+                "경도":
+                    row[
+                        "경도"
+                    ],
+                "주소":
+                    row[
+                        "주소"
+                    ],
+                "부가정보":
+                    row[
+                        "부가정보"
+                    ],
+                "원본구분":
+                    row[
+                        "원본구분"
+                    ],
+            }
+        )
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(
+        rows
+    )
 
 
 # ============================================================
-# 10. 1박2일
+# 13. 1박2일
 # ============================================================
 
 def optimize_1n2d(
     candidates: pd.DataFrame,
     selected_categories: list[str],
     provider: TravelTimeProvider,
-    start_lat: Optional[float],
-    start_lon: Optional[float],
-    start_time: str = DEFAULT_START_TIME,
+    start_lat: float,
+    start_lon: float,
+    start_time: str
+    = DEFAULT_START_TIME,
 ) -> tuple[pd.DataFrame, dict]:
 
-    # 1일차: 8시간
     route1 = optimize_route(
         candidates,
         selected_categories,
@@ -1849,44 +3780,51 @@ def optimize_1n2d(
 
     if not route1:
         raise RuntimeError(
-            "1일차 경로를 생성하지 못했습니다."
+            "1일차 경로 생성 실패"
         )
 
-    detail1 = build_route_detail(
-        route1,
-        candidates,
-        provider,
-        day=1,
-        start_lat=start_lat,
-        start_lon=start_lon,
-        start_time=start_time,
+    detail1 = (
+        build_route_detail(
+            route1,
+            candidates,
+            provider,
+            day=1,
+            start_lat=start_lat,
+            start_lon=start_lon,
+            start_time=start_time,
+        )
     )
 
-    used_ids = {
-        candidates.loc[i][
-            "place_id"
+    used_internal_ids = {
+        candidates.loc[
+            idx,
+            "internal_id",
         ]
-        for i in route1
+        for idx in route1
     }
 
-    remaining = candidates[
-        ~candidates[
-            "place_id"
-        ].isin(used_ids)
-    ].copy().reset_index(
-        drop=True
+    remaining = (
+        candidates[
+            ~candidates[
+                "internal_id"
+            ].isin(
+                used_internal_ids
+            )
+        ]
+        .copy()
+        .reset_index(
+            drop=True
+        )
     )
 
-    # 숙소 데이터가 아직 없으므로,
-    # 1일차 마지막 장소 인근에서 숙박한다고 가정
     last = candidates.loc[
         route1[-1]
     ]
 
-    day2_start_lat = float(
+    day2_lat = float(
         last["위도"]
     )
-    day2_start_lon = float(
+    day2_lon = float(
         last["경도"]
     )
 
@@ -1897,55 +3835,72 @@ def optimize_1n2d(
         max_stops=6,
         target_stops=5,
         provider=provider,
-        start_lat=day2_start_lat,
-        start_lon=day2_start_lon,
+        start_lat=day2_lat,
+        start_lon=day2_lon,
         start_time=start_time,
     )
 
     if route2:
-        detail2 = build_route_detail(
-            route2,
-            remaining,
-            provider,
-            day=2,
-            start_lat=day2_start_lat,
-            start_lon=day2_start_lon,
-            start_time=start_time,
+        detail2 = (
+            build_route_detail(
+                route2,
+                remaining,
+                provider,
+                day=2,
+                start_lat=day2_lat,
+                start_lon=day2_lon,
+                start_time=start_time,
+            )
         )
 
         detail = pd.concat(
-            [detail1, detail2],
+            [
+                detail1,
+                detail2,
+            ],
             ignore_index=True,
         )
+
     else:
         detail = detail1
 
-    meta = {
-        "1일차장소수": len(route1),
-        "2일차장소수": len(route2),
-        "숙박가정":
-            (
-                f"1일차 마지막 장소 "
-                f"'{last['장소명']}' 인근 숙박"
-            ),
-    }
-
-    return detail, meta
+    return (
+        detail,
+        {
+            "1일차장소수":
+                len(route1),
+            "2일차장소수":
+                len(route2),
+            "숙박가정":
+                (
+                    "1일차 마지막 장소 "
+                    f"'{last['장소명']}' "
+                    "인근 숙박"
+                ),
+        },
+    )
 
 
 # ============================================================
-# 11. 메인 추천 함수
+# 14. 메인 추천 함수
 # ============================================================
 
 def recommend_local_on_trip(
     selected_sido: str,
     selected_categories: list[str],
     trip_type: str = "day",
-    selected_sigungu: Optional[str] = None,
-    start_lat: Optional[float] = None,
-    start_lon: Optional[float] = None,
-    start_time: str = DEFAULT_START_TIME,
-    top_region_n: int = 5,
+    selected_sigungu: Optional[str]
+    = None,
+    start_lat: Optional[float]
+    = None,
+    start_lon: Optional[float]
+    = None,
+    start_time: str
+    = DEFAULT_START_TIME,
+    base_dir: Path
+    = BASE_DIR,
+    top_region_n: int
+    = 5,
 ) -> dict:
 
     if trip_type not in {
@@ -1957,145 +3912,162 @@ def recommend_local_on_trip(
     }:
         raise ValueError(
             "trip_type은 "
-            "2h/4h/6h/day/1n2d 중 하나여야 합니다."
+            "2h/4h/6h/day/1n2d"
+            " 중 하나여야 합니다."
         )
 
     selected_categories = [
         x.strip()
-        for x in selected_categories
+        for x
+        in selected_categories
         if x.strip()
     ]
 
-    if not selected_categories:
+    invalid = (
+        set(
+            selected_categories
+        )
+        - VALID_CATEGORIES
+    )
+
+    if invalid:
         raise ValueError(
-            "최소 1개 카테고리를 선택해야 합니다."
+            "지원하지 않는 카테고리: "
+            f"{sorted(invalid)}"
         )
 
+    output_dir = (
+        base_dir
+        / OUTPUT_DIR_NAME
+    )
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
     # --------------------------------------------------------
-    # STEP 1. 지역 순위
+    # 1) 지역 추천
     # --------------------------------------------------------
-    region_df = load_region_scores()
-
-    region_ranking = get_region_ranking(
-        region_df,
-        selected_sido,
+    region_df = (
+        load_region_scores(
+            base_dir
+        )
     )
 
-    region_out = (
-        OUTPUT_DIR
-        / f"01_{selected_sido}_지역추천순위.csv"
+    region_ranking = (
+        get_region_ranking(
+            region_df,
+            selected_sido,
+        )
     )
 
-    region_ranking.to_csv(
-        region_out,
-        index=False,
-        encoding="utf-8-sig",
-    )
-
-    formal_regions = region_ranking[
+    formal = region_ranking[
         region_ranking[
             "지역추천구분"
-        ] == "정식_12개월"
+        ]
+        == "정식_12개월"
     ]
 
-    # 사용자가 시군구를 직접 선택하지 않았으면
-    # 해당 시도 로컬발견가능성 1위 지역 사용
     if selected_sigungu is None:
-        if not formal_regions.empty:
+
+        if not formal.empty:
             selected_sigungu = (
-                formal_regions.iloc[0][
+                formal.iloc[0][
                     "시군구"
                 ]
             )
         else:
-            usable_short = region_ranking[
+            usable = region_ranking[
                 region_ranking[
                     "지역추천점수"
                 ].notna()
             ]
 
-            if usable_short.empty:
+            if usable.empty:
                 raise RuntimeError(
-                    "추천 가능한 지역 점수가 없습니다."
+                    "추천 가능한 지역이 없습니다."
                 )
 
             selected_sigungu = (
-                usable_short.iloc[0][
+                usable.iloc[0][
                     "시군구"
                 ]
             )
 
-    valid_selected = (
-        (
-            region_ranking["시군구"]
-            == selected_sigungu
-        )
-    ).any()
-
-    if not valid_selected:
+    if not (
+        region_ranking[
+            "시군구"
+        ]
+        == selected_sigungu
+    ).any():
         raise ValueError(
-            f"{selected_sido} 안에 "
-            f"'{selected_sigungu}' 지역이 없습니다."
+            f"{selected_sido}에 "
+            f"'{selected_sigungu}'가 없습니다."
         )
 
-    # --------------------------------------------------------
-    # STEP 2. 장소 데이터
-    # --------------------------------------------------------
-    food = load_food_places()
+    region_path = (
+        output_dir
+        / (
+            f"01_{selected_sido}"
+            "_지역추천순위.csv"
+        )
+    )
 
-    tour, tour_qa = load_tour_places(
-        region_df
+    region_ranking.to_csv(
+        region_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    # --------------------------------------------------------
+    # 2) 모든 장소 데이터 생성
+    # --------------------------------------------------------
+    all_places, qa = (
+        build_all_places(
+            base_dir,
+            region_df,
+        )
     )
 
     qa_path = (
-        OUTPUT_DIR
-        / "00_관광지데이터_QA.csv"
+        output_dir
+        / "00_통합데이터_QA.csv"
     )
 
-    tour_qa.to_csv(
+    qa.to_csv(
         qa_path,
         index=False,
         encoding="utf-8-sig",
     )
 
-    all_places = pd.concat(
-        [food, tour],
-        ignore_index=True,
-    )
-
-    # 같은 데이터셋 내부 동일 ID는 이미 제거/검증.
-    # 음식점/관광지는 ID 출처가 달라도 충돌 가능하므로
-    # 원본구분을 붙인 내부키 사용.
-    all_places["internal_id"] = (
-        all_places["원본구분"]
-        + "_"
-        + all_places["place_id"]
-    )
-
     # --------------------------------------------------------
-    # STEP 3. 선택 지역 후보
+    # 3) 선택 지역 + 카테고리 후보
     # --------------------------------------------------------
-    candidates = get_place_candidates(
+    (
+        candidates,
+        market_duplicate_records,
+    ) = get_place_candidates(
         all_places,
         selected_sido,
         selected_sigungu,
         selected_categories,
     )
 
-    # 출발지가 없으면 선택 지역 후보들의 중앙값 좌표를 자동 사용
-    auto_start_used = False
-
-    if start_lat is None or start_lon is None:
-        start_lat, start_lon = infer_region_center(
-            candidates
-        )
-        auto_start_used = True
+    category_counts = (
+        candidates[
+            "추천카테고리"
+        ]
+        .value_counts()
+        .to_dict()
+    )
 
     candidate_path = (
-        OUTPUT_DIR
+        output_dir
         / (
             f"02_{selected_sido}_"
-            f"{selected_sigungu}_장소후보.csv"
+            f"{selected_sigungu}_"
+            "장소후보.csv"
         )
     )
 
@@ -2106,48 +4078,85 @@ def recommend_local_on_trip(
     )
 
     # --------------------------------------------------------
-    # STEP 4. 경로
+    # 4) 출발점
     # --------------------------------------------------------
-    provider = TravelTimeProvider(
-        cache_file=(
-            OUTPUT_DIR
-            / "travel_time_cache.json"
-        ),
-        api_key=KAKAO_REST_API_KEY,
+    auto_start_used = False
+
+    if (
+        start_lat is None
+        or start_lon is None
+    ):
+        (
+            start_lat,
+            start_lon,
+        ) = infer_region_center(
+            candidates
+        )
+
+        auto_start_used = True
+
+    # --------------------------------------------------------
+    # 5) 이동시간 provider
+    # --------------------------------------------------------
+    api_key = os.getenv(
+        "KAKAO_REST_API_KEY",
+        "",
+    )
+
+    provider = (
+        TravelTimeProvider(
+            cache_file=(
+                output_dir
+                / "travel_time_cache.json"
+            ),
+            api_key=api_key,
+        )
     )
 
     route_meta = {}
 
+    # --------------------------------------------------------
+    # 6) 경로 최적화
+    # --------------------------------------------------------
     if trip_type == "1n2d":
 
-        route_detail, route_meta = (
-            optimize_1n2d(
-                candidates,
-                selected_categories,
-                provider,
-                start_lat,
-                start_lon,
-                start_time,
-            )
+        (
+            route_detail,
+            route_meta,
+        ) = optimize_1n2d(
+            candidates,
+            selected_categories,
+            provider,
+            start_lat,
+            start_lon,
+            start_time,
         )
 
     else:
-        cfg = TRIP_CONFIG[
-            trip_type
-        ]
+        cfg = (
+            TRIP_CONFIG[
+                trip_type
+            ]
+        )
 
         route = optimize_route(
             candidates,
             selected_categories,
-            budget_min=cfg[
-                "budget_min"
-            ],
-            max_stops=cfg[
-                "max_stops"
-            ],
-            target_stops=cfg[
-                "target_stops"
-            ],
+            budget_min=(
+                cfg[
+                    "budget_min"
+                ]
+            ),
+            max_stops=(
+                cfg[
+                    "max_stops"
+                ]
+            ),
+            target_stops=(
+                cfg[
+                    "target_stops"
+                ]
+            ),
             provider=provider,
             start_lat=start_lat,
             start_lon=start_lon,
@@ -2156,47 +4165,55 @@ def recommend_local_on_trip(
 
         if not route:
             raise RuntimeError(
-                "주어진 시간 안에 경로를 생성하지 못했습니다."
+                "주어진 시간 안에 "
+                "경로를 생성하지 못했습니다."
             )
 
-        route_detail = build_route_detail(
-            route,
-            candidates,
-            provider,
-            day=1,
-            start_lat=start_lat,
-            start_lon=start_lon,
-            start_time=start_time,
+        route_detail = (
+            build_route_detail(
+                route,
+                candidates,
+                provider,
+                day=1,
+                start_lat=start_lat,
+                start_lon=start_lon,
+                start_time=start_time,
+            )
         )
 
     provider.save()
 
-    # 선택한 모든 카테고리가 가능한 경우
-    # 실제 최종 경로에 포함됐는지 체크
+    actual_categories = set(
+        route_detail[
+            "카테고리"
+        ]
+    )
+
     available_categories = set(
-        candidates["추천카테고리"]
+        candidates[
+            "추천카테고리"
+        ]
     )
 
     expected_categories = (
-        set(selected_categories)
+        set(
+            selected_categories
+        )
         & available_categories
     )
 
-    actual_categories = set(
-        route_detail["카테고리"]
-    )
-
-    missing_route_categories = (
+    missing_categories = (
         expected_categories
         - actual_categories
     )
 
     route_path = (
-        OUTPUT_DIR
+        output_dir
         / (
             f"03_{selected_sido}_"
             f"{selected_sigungu}_"
-            f"{trip_type}_추천경로.csv"
+            f"{trip_type}_"
+            "추천경로.csv"
         )
     )
 
@@ -2206,14 +4223,12 @@ def recommend_local_on_trip(
         encoding="utf-8-sig",
     )
 
-    # --------------------------------------------------------
-    # STEP 5. 요약
-    # --------------------------------------------------------
     selected_region_row = (
         region_ranking[
             region_ranking[
                 "시군구"
-            ] == selected_sigungu
+            ]
+            == selected_sigungu
         ]
         .iloc[0]
     )
@@ -2249,6 +4264,33 @@ def recommend_local_on_trip(
             ),
         "선택카테고리":
             selected_categories,
+        "후보카테고리별개수":
+            {
+                str(k): int(v)
+                for k, v
+                in category_counts.items()
+            },
+        "시장관광지의미중복제거건수":
+            len(
+                market_duplicate_records
+            ),
+        "시장관광지의미중복제거내역":
+            market_duplicate_records,
+        "점수정책":
+            {
+                "장소추천점수":
+                    "카테고리 내부 후보 선정용 원본 점수",
+                "경로선택점수":
+                    (
+                        "카테고리내순위를 공통 100~55점 척도로 변환한 "
+                        "경로 최적화용 점수"
+                    ),
+                "관광지유형보정":
+                    (
+                        "일반 관광에서 자연·문화·생태 계열 소폭 우대, "
+                        "레저·웰니스 계열 과다선택 완화"
+                    ),
+            },
         "여행유형":
             trip_type,
         "일정시작시간":
@@ -2256,12 +4298,24 @@ def recommend_local_on_trip(
         "출발지자동설정":
             auto_start_used,
         "출발위도":
-            round(float(start_lat), 6),
+            round(
+                float(
+                    start_lat
+                ),
+                6,
+            ),
         "출발경도":
-            round(float(start_lon), 6),
+            round(
+                float(
+                    start_lon
+                ),
+                6,
+            ),
         "경로장소수":
             int(
-                len(route_detail)
+                len(
+                    route_detail
+                )
             ),
         "경로포함카테고리":
             sorted(
@@ -2269,13 +4323,18 @@ def recommend_local_on_trip(
             ),
         "포함하지못한카테고리":
             sorted(
-                missing_route_categories
+                missing_categories
             ),
         "관광지세부분류":
             route_detail.loc[
-                route_detail["카테고리"] == "관광지",
-                "세부분류"
-            ].astype(str).tolist(),
+                route_detail[
+                    "카테고리"
+                ]
+                == "관광지",
+                "세부분류",
+            ]
+            .astype(str)
+            .tolist(),
         "총이동시간분":
             round(
                 float(
@@ -2297,13 +4356,36 @@ def recommend_local_on_trip(
         "이동시간방식":
             (
                 "Kakao Mobility 자동차 길찾기"
-                if KAKAO_REST_API_KEY
+                if api_key
                 else "위경도 기반 추정"
             ),
+        "데이터구조":
+            {
+                "음식점": [
+                    RESTAURANT_PLACE_NAME,
+                    RESTAURANT_SCORE_NAME,
+                    RESTAURANT_LOCATION_NAME,
+                    PLACE_RESTAURANT_NAME,
+                ],
+                "전통시장": [
+                    TRADITIONAL_MARKET_NAME,
+                    TRADITIONAL_MARKET_FACILITY_NAME,
+                    PLACE_MARKET_NAME,
+                ],
+                "관광지": [
+                    TOUR_SCORE_FINAL_NAME,
+                    TOUR_GEO_FINAL_NAME,
+                ],
+                "관광지_QA원본": [
+                    TOUR_SCORE_AUDIT_NAME,
+                ],
+            },
         "지역추천TOP":
             (
                 region_ranking
-                .head(top_region_n)[
+                .head(
+                    top_region_n
+                )[
                     [
                         "시군구",
                         "지역추천구분",
@@ -2319,7 +4401,7 @@ def recommend_local_on_trip(
     }
 
     summary_path = (
-        OUTPUT_DIR
+        output_dir
         / (
             f"04_{selected_sido}_"
             f"{selected_sigungu}_"
@@ -2337,23 +4419,29 @@ def recommend_local_on_trip(
     )
 
     print()
-    print("=" * 70)
-    print("LOCAL:ON 추천 완료")
-    print("=" * 70)
     print(
-        f"선택 시도: {selected_sido}"
+        "=" * 72
     )
     print(
-        f"추천/선택 지역: {selected_sigungu}"
+        "LOCAL:ON v5.1 추천 완료"
     )
     print(
-        "선택 카테고리:",
+        "=" * 72
+    )
+    print(
+        f"시도: {selected_sido}"
+    )
+    print(
+        f"시군구: {selected_sigungu}"
+    )
+    print(
+        "카테고리:",
         ", ".join(
             selected_categories
-        )
+        ),
     )
     print(
-        f"여행 유형: {trip_type}"
+        f"후보 개수: {category_counts}"
     )
     print()
     print(
@@ -2365,61 +4453,92 @@ def recommend_local_on_trip(
                 "출발예정",
                 "장소명",
                 "카테고리",
+                "세부분류",
                 "장소추천점수",
+                "경로선택점수",
                 "이전장소에서_이동분",
-                "체류시간분",
             ]
         ].to_string(
             index=False
         )
     )
     print()
-    print("생성 파일")
-    print(" -", region_out)
-    print(" -", candidate_path)
-    print(" -", route_path)
-    print(" -", summary_path)
-    print(" -", qa_path)
+    print(
+        "생성 파일:"
+    )
+    print(
+        " -",
+        qa_path,
+    )
+    print(
+        " -",
+        region_path,
+    )
+    print(
+        " -",
+        candidate_path,
+    )
+    print(
+        " -",
+        route_path,
+    )
+    print(
+        " -",
+        summary_path,
+    )
 
     return {
         "region_ranking":
             region_ranking,
+        "all_places":
+            all_places,
         "candidates":
             candidates,
         "route":
             route_detail,
         "summary":
             summary,
-        "tour_qa":
-            tour_qa,
+        "qa":
+            qa,
     }
 
 
 # ============================================================
-# 12. CLI
+# 15. CLI
 # ============================================================
 
 def main():
 
-    parser = argparse.ArgumentParser(
-        description=(
-            "LOCAL:ON 지역/장소/경로 추천"
+    parser = (
+        argparse.ArgumentParser(
+            description=(
+                "LOCAL:ON v5.1 "
+                "지역/장소/경로 추천"
+            )
         )
+    )
+
+    parser.add_argument(
+        "--base-dir",
+        default=str(
+            BASE_DIR
+        ),
+        help=(
+            "LOCAL:ON 데이터 폴더"
+        ),
     )
 
     parser.add_argument(
         "--sido",
         default="충청남도",
-        help="예: 충청남도",
     )
 
     parser.add_argument(
         "--sigungu",
         default=None,
         help=(
-            "예: 공주시. "
-            "생략 시 해당 시도 로컬발견가능성 "
-            "1위 지역을 자동 선택"
+            "생략 시 선택 시도에서 "
+            "추천점수가 가장 높은 지역 사용"
         ),
     )
 
@@ -2438,11 +4557,22 @@ def main():
     parser.add_argument(
         "--categories",
         default=(
-            "맛집,관광지,카페/베이커리"
+            "맛집,관광지,"
+            "카페/베이커리,"
+            "전통시장"
         ),
         help=(
-            "쉼표 구분. "
-            "맛집,관광지,카페/베이커리"
+            "쉼표 구분: "
+            "맛집,관광지,"
+            "카페/베이커리,"
+            "전통시장"
+        ),
+    )
+
+    parser.add_argument(
+        "--start-time",
+        default=(
+            DEFAULT_START_TIME
         ),
     )
 
@@ -2458,29 +4588,44 @@ def main():
         default=None,
     )
 
-
-    parser.add_argument(
-        "--start-time",
-        default=DEFAULT_START_TIME,
-        help="여행 시작 시각 HH:MM (기본 10:00)",
+    args = (
+        parser.parse_args()
     )
-
-    args = parser.parse_args()
 
     categories = [
         x.strip()
-        for x in args.categories.split(",")
+        for x
+        in args.categories.split(
+            ","
+        )
         if x.strip()
     ]
 
     recommend_local_on_trip(
-        selected_sido=args.sido,
-        selected_sigungu=args.sigungu,
-        selected_categories=categories,
-        trip_type=args.trip,
-        start_lat=args.start_lat,
-        start_lon=args.start_lon,
-        start_time=args.start_time,
+        selected_sido=(
+            args.sido
+        ),
+        selected_sigungu=(
+            args.sigungu
+        ),
+        selected_categories=(
+            categories
+        ),
+        trip_type=(
+            args.trip
+        ),
+        start_lat=(
+            args.start_lat
+        ),
+        start_lon=(
+            args.start_lon
+        ),
+        start_time=(
+            args.start_time
+        ),
+        base_dir=Path(
+            args.base_dir
+        ),
     )
 
 
