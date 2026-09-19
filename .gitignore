@@ -1,0 +1,14 @@
+.env
+.env.*
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+경로추천_결과/
+travel_time_cache.json
+
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
