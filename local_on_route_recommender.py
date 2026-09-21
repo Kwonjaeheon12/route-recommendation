@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-LOCAL:ON 경로 추천 모델 v5.1
+LOCAL:ON 경로 추천 모델 v6
 ==========================
-분리형 DB + 카테고리 공정비교 + 시장 정규화 고도화 버전
+개인화 점수 + 관광성향 + 명시적 코스 조합 구조 반영 버전
 
 [지역]
 - 03_로컬발견가능성_지역별.csv
@@ -62,7 +62,7 @@ except ImportError:
 # 0. 경로 설정
 # ============================================================
 
-DEFAULT_BASE_DIR = r"C:\Users\User\Desktop"
+DEFAULT_BASE_DIR = r"C:\Users\jason\OneDrive - sch.ac.kr\바탕 화면"
 BASE_DIR = Path(os.getenv("LOCAL_ON_BASE_DIR", DEFAULT_BASE_DIR))
 
 OUTPUT_DIR_NAME = "경로추천_결과"
@@ -167,6 +167,17 @@ MULTI_CATEGORY_MAX_VISITS = {
 
 TOP_CANDIDATES_PER_CATEGORY = 10
 BEAM_WIDTH = 180
+
+VALID_THEMES = {
+    "일반",
+    "자연/힐링",
+    "문화/역사",
+    "레저/체험",
+    "로컬/시장",
+}
+
+DEFAULT_LOCAL_WEIGHT = 0.6
+DEFAULT_THEME_WEIGHT = 0.35
 
 NEARBY_TOUR_CLUSTER_KM = 0.5
 SAME_TOUR_SUBCATEGORY_PENALTY = 10.0
@@ -2290,92 +2301,350 @@ def remove_market_tour_duplicates(
     )
 
 
-def general_tour_type_adjustment(
-    row: pd.Series,
+def rank_to_preference_score(
+    rank_value,
 ) -> float:
     """
-    일반 관광 기본 모드의 세부분류 보정.
-
-    자연/문화/생태/역사/경관 계열은 소폭 우대,
-    레저/스포츠/웰니스/골프/스파 계열은 사용자의 명시적 테마 선택이
-    없는 기본 일정에서 과도하게 선택되지 않도록 감점한다.
-
-    원래 관광지 추천점수는 변경하지 않는다.
+    순위를 0~100에 가까운 동일 척도로 변환한다.
+    1위=100, 100위=1.
+    현지인/외지인 원점수의 서로 다른 범위를 그대로 섞지 않기 위함이다.
     """
-    if row["추천카테고리"] != "관광지":
-        return 0.0
+    if pd.isna(rank_value):
+        return np.nan
+
+    try:
+        rank_value = float(rank_value)
+    except Exception:
+        return np.nan
+
+    if rank_value <= 0:
+        return np.nan
+
+    return float(
+        np.clip(
+            101.0 - rank_value,
+            1.0,
+            100.0,
+        )
+    )
+
+
+def calculate_theme_fit_score(
+    row: pd.Series,
+    theme: str,
+) -> float:
+    """
+    사용자 관광성향 적합도(0~100).
+
+    중요:
+    이 점수를 '상위 후보 선정 이후'에 붙이지 않고,
+    전체 지역 후보에 먼저 계산한 뒤 개인화점수에 반영한다.
+    """
+    if theme == "일반":
+        return 50.0
+
+    category = str(
+        row.get(
+            "추천카테고리",
+            "",
+        )
+    )
 
     text = (
-        str(row["세부분류"])
+        str(
+            row.get(
+                "세부분류",
+                "",
+            )
+        )
         + " "
-        + str(row["장소명"])
+        + str(
+            row.get(
+                "장소명",
+                "",
+            )
+        )
+        + " "
+        + str(
+            row.get(
+                "부가정보",
+                "",
+            )
+        )
     ).lower()
 
-    special = [
-        "레저",
-        "스포츠",
-        "웰니스",
-        "골프",
-        "스파",
-    ]
+    theme_keywords = {
+        "자연/힐링": [
+            "자연",
+            "생태",
+            "공원",
+            "산림",
+            "휴양",
+            "숲",
+            "해수욕",
+            "해변",
+            "바다",
+            "갈대",
+            "수목원",
+            "정원",
+            "웰니스",
+            "스파",
+            "온천",
+            "산책",
+            "둘레길",
+            "항",
+            "포구",
+        ],
+        "문화/역사": [
+            "문화",
+            "역사",
+            "유적",
+            "유산",
+            "사찰",
+            "사적",
+            "박물",
+            "미술",
+            "고택",
+            "성곽",
+            "전통",
+            "문화재",
+            "기념관",
+            "문학",
+        ],
+        "레저/체험": [
+            "레저",
+            "스포츠",
+            "골프",
+            "체험",
+            "액티비티",
+            "놀이",
+            "수상",
+            "캠핑",
+            "승마",
+            "낚시",
+            "스키",
+            "패러",
+        ],
+        "로컬/시장": [
+            "시장",
+            "전통",
+            "상설장",
+            "5일장",
+            "오일장",
+            "골목",
+            "마을",
+            "특산",
+            "수산",
+            "로컬",
+            "향토",
+        ],
+    }
 
-    general = [
-        "자연",
-        "생태",
-        "문화",
-        "역사",
-        "경관",
-        "공원",
-        "해수욕",
-        "항",
-        "포구",
-        "전망",
-        "박물",
-        "미술",
-    ]
+    matched = sum(
+        1
+        for keyword
+        in theme_keywords[
+            theme
+        ]
+        if keyword in text
+    )
 
-    if any(
-        k in text
-        for k in special
+    if matched >= 2:
+        score = 100.0
+    elif matched == 1:
+        score = 90.0
+    else:
+        score = 35.0
+
+    # 카테고리 자체가 성향과 강하게 맞는 경우
+    if (
+        theme == "로컬/시장"
+        and category == "전통시장"
     ):
-        return (
-            GENERAL_TOUR_SPECIAL_PENALTY
+        score = 100.0
+
+    # 자연/힐링에서도 카페/맛집은 일정 구성상 배제하지 않고 중립값 유지
+    if (
+        theme in {
+            "자연/힐링",
+            "문화/역사",
+            "레저/체험",
+        }
+        and category
+        in {
+            "맛집",
+            "카페/베이커리",
+            "전통시장",
+        }
+        and matched == 0
+    ):
+        score = 50.0
+
+    return float(
+        np.clip(
+            score,
+            0.0,
+            100.0,
+        )
+    )
+
+
+def add_personalized_scores(
+    places: pd.DataFrame,
+    theme: str,
+    local_weight: float,
+    theme_weight: float,
+) -> pd.DataFrame:
+    """
+    후보를 자르기 전에 사용자 성향 점수를 계산한다.
+
+    1) 현지인순위 -> 로컬성향점수
+    2) 외지인순위 -> 유명성향점수
+    3) local_weight로 로컬/유명 비율 반영
+    4) 관광테마 적합도 반영
+    5) 최종 개인화점수 생성
+
+    전통시장처럼 현지인/외지인 순위가 없는 데이터는
+    같은 카테고리 내 원래 장소추천점수를 0~100으로 정규화해 기본점수로 사용한다.
+    """
+    if theme not in VALID_THEMES:
+        raise ValueError(
+            f"지원하지 않는 theme: {theme}"
         )
 
-    if any(
-        k in text
-        for k in general
+    if not (
+        0.0 <= local_weight <= 1.0
     ):
-        return (
-            GENERAL_TOUR_POSITIVE_BONUS
+        raise ValueError(
+            "local_weight는 0~1 사이여야 합니다."
         )
 
-    return 0.0
+    if not (
+        0.0 <= theme_weight <= 1.0
+    ):
+        raise ValueError(
+            "theme_weight는 0~1 사이여야 합니다."
+        )
+
+    x = places.copy()
+
+    popular_weight = (
+        1.0
+        - local_weight
+    )
+
+    x["로컬성향점수"] = (
+        x["현지인순위"]
+        .apply(
+            rank_to_preference_score
+        )
+    )
+
+    x["유명성향점수"] = (
+        x["외지인순위"]
+        .apply(
+            rank_to_preference_score
+        )
+    )
+
+    # 순위 데이터가 없는 장소용 기본점수:
+    # 카테고리 내 원점수 percentile rank를 1~100으로 변환
+    x["원점수카테고리정규화"] = (
+        x.groupby(
+            "추천카테고리"
+        )["장소추천점수"]
+        .rank(
+            pct=True,
+            method="average",
+        )
+        * 99.0
+        + 1.0
+    )
+
+    has_local = (
+        x["로컬성향점수"]
+        .notna()
+    )
+
+    has_popular = (
+        x["유명성향점수"]
+        .notna()
+    )
+
+    weighted = (
+        x["로컬성향점수"]
+        .fillna(0.0)
+        * local_weight
+        + x["유명성향점수"]
+        .fillna(0.0)
+        * popular_weight
+    )
+
+    available_weight = (
+        has_local.astype(float)
+        * local_weight
+        + has_popular.astype(float)
+        * popular_weight
+    )
+
+    # 한쪽 순위만 존재할 때는 있는 정보만으로 재정규화.
+    # 둘 다 없으면 카테고리 내부 원점수 정규화 사용.
+    x["로컬유명혼합점수"] = np.where(
+        available_weight > 0,
+        weighted
+        / available_weight.replace(
+            0,
+            np.nan,
+        ),
+        x["원점수카테고리정규화"],
+    )
+
+    x["관광성향적합점수"] = x.apply(
+        calculate_theme_fit_score,
+        axis=1,
+        theme=theme,
+    )
+
+    effective_theme_weight = (
+        0.0
+        if theme == "일반"
+        else theme_weight
+    )
+
+    x["개인화점수"] = (
+        x["로컬유명혼합점수"]
+        * (
+            1.0
+            - effective_theme_weight
+        )
+        + x["관광성향적합점수"]
+        * effective_theme_weight
+    ).clip(
+        lower=0.0,
+        upper=100.0,
+    )
+
+    return x
 
 
 def add_route_selection_score(
     candidates: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    서로 다른 카테고리의 원점수 척도가 다르므로
-    경로 최적화용 공통점수를 별도로 생성한다.
+    개인화점수로 후보를 고른 뒤,
+    각 카테고리 내 개인화 순위를 공통 경로점수로 바꾼다.
 
-    - 원래 '장소추천점수'는 그대로 보존
-    - 카테고리내순위 1위 = 100
-    - 이후 순위마다 5점 감소, 최저 55
-    - 관광지에만 일반 관광 유형 보정 적용
+    여기서는 관광테마를 다시 더하지 않는다.
+    관광성향은 이미 후보 선정 이전의 개인화점수에 반영되어 있기 때문이다.
     """
     x = candidates.copy()
-
-    x["관광유형보정점수"] = x.apply(
-        general_tour_type_adjustment,
-        axis=1,
-    )
 
     x["경로선택기본점수"] = (
         100.0
         - (
-            x["카테고리내순위"]
+            x[
+                "카테고리내순위"
+            ]
             - 1
         )
         * ROUTE_RANK_STEP
@@ -2385,11 +2654,9 @@ def add_route_selection_score(
     )
 
     x["경로선택점수"] = (
-        x["경로선택기본점수"]
-        + x["관광유형보정점수"]
-    ).clip(
-        lower=0.0,
-        upper=100.0,
+        x[
+            "경로선택기본점수"
+        ]
     )
 
     return x
@@ -2404,6 +2671,9 @@ def get_place_candidates(
     selected_sido: str,
     selected_sigungu: str,
     selected_categories: list[str],
+    theme: str = "일반",
+    local_weight: float = DEFAULT_LOCAL_WEIGHT,
+    theme_weight: float = DEFAULT_THEME_WEIGHT,
 ) -> tuple[pd.DataFrame, list[dict]]:
 
     invalid = (
@@ -2417,6 +2687,16 @@ def get_place_candidates(
             f"{sorted(invalid)}"
         )
 
+    if theme not in VALID_THEMES:
+        raise ValueError(
+            "지원하지 않는 관광성향: "
+            f"{theme}"
+        )
+
+    # --------------------------------------------------------
+    # 1. 지역 + 카테고리 전체 후보를 먼저 가져온다.
+    #    여기서는 TOP N을 자르지 않는다.
+    # --------------------------------------------------------
     x = all_places[
         (
             all_places["시도"]
@@ -2441,15 +2721,24 @@ def get_place_candidates(
             "후보를 찾지 못했습니다."
         )
 
-    # 전통시장 카테고리를 별도로 선택한 경우,
-    # 관광지 데이터의 '시장' 분류는 전통시장 DB와 의미가 겹치므로 제외한다.
-    # 전통시장 DB를 시장 카테고리의 단일 기준(source of truth)으로 사용한다.
+    # --------------------------------------------------------
+    # 2. 관광지-전통시장 의미 중복 제거
+    # --------------------------------------------------------
     semantic_market_records = []
 
     if "전통시장" in selected_categories:
         semantic_market_mask = (
-            (x["추천카테고리"] == "관광지")
-            & x["세부분류"].astype(str).str.contains(
+            (
+                x[
+                    "추천카테고리"
+                ]
+                == "관광지"
+            )
+            & x[
+                "세부분류"
+            ]
+            .astype(str)
+            .str.contains(
                 "시장",
                 na=False,
             )
@@ -2461,13 +2750,18 @@ def get_place_candidates(
             semantic_market_records.append(
                 {
                     "제거된관광지":
-                        row["장소명"],
+                        row[
+                            "장소명"
+                        ],
                     "유지된전통시장":
                         "전통시장 DB 사용",
                     "거리km":
                         None,
                     "제거사유":
-                        "전통시장 카테고리 선택 시 관광지 시장분류 의미중복 제거",
+                        (
+                            "전통시장 카테고리 선택 시 "
+                            "관광지 시장분류 의미중복 제거"
+                        ),
                 }
             )
 
@@ -2475,12 +2769,12 @@ def get_place_candidates(
             ~semantic_market_mask
         ].copy()
 
-    # 남아있는 관광지 시장과 전통시장 간 실제 동일 장소 중복도 추가 제거
-    x, exact_duplicate_records = (
-        remove_market_tour_duplicates(
-            x,
-            selected_categories,
-        )
+    (
+        x,
+        exact_duplicate_records,
+    ) = remove_market_tour_duplicates(
+        x,
+        selected_categories,
     )
 
     duplicate_records = (
@@ -2488,11 +2782,25 @@ def get_place_candidates(
         + exact_duplicate_records
     )
 
-    # 원래 점수는 해당 카테고리 내부 후보 선정에만 사용
+    # --------------------------------------------------------
+    # 3. 전체 지역 후보에 사용자 성향을 먼저 반영
+    # --------------------------------------------------------
+    x = add_personalized_scores(
+        x,
+        theme=theme,
+        local_weight=local_weight,
+        theme_weight=theme_weight,
+    )
+
+    # --------------------------------------------------------
+    # 4. 개인화점수로 카테고리 내부 순위 계산
+    # --------------------------------------------------------
     x["카테고리내순위"] = (
         x.groupby(
             "추천카테고리"
-        )["장소추천점수"]
+        )[
+            "개인화점수"
+        ]
         .rank(
             method="first",
             ascending=False,
@@ -2500,12 +2808,19 @@ def get_place_candidates(
         .astype(int)
     )
 
+    # --------------------------------------------------------
+    # 5. 성향 반영 후에 TOP N 후보를 자른다.
+    # --------------------------------------------------------
     x = x[
-        x["카테고리내순위"]
+        x[
+            "카테고리내순위"
+        ]
         <= TOP_CANDIDATES_PER_CATEGORY
     ].copy()
 
-    # 실제 경로 최적화에는 공통 척도의 별도 점수를 사용
+    # --------------------------------------------------------
+    # 6. 코스 최적화용 공통점수 생성
+    # --------------------------------------------------------
     x = add_route_selection_score(
         x
     )
@@ -3285,7 +3600,112 @@ def route_total_minutes(
 # 11. 경로 최적화
 # ============================================================
 
-def optimize_route(
+def evaluate_route(
+    route: list[int],
+    candidates: pd.DataFrame,
+    selected_categories: list[str],
+    target_stops: int,
+    provider: TravelTimeProvider,
+    start_lat: float,
+    start_lon: float,
+    start_minute: int,
+) -> tuple[float, list[dict]]:
+    """
+    하나의 코스 조합을 평가한다.
+
+    평가 요소:
+    - 개인화 기반 경로선택점수
+    - 선택 카테고리 포함 여부
+    - 시간대 적합성
+    - 관광지 세부분류 다양성
+    - 이동시간 패널티
+    - 목표 방문장소 수
+    """
+    (
+        schedule,
+        place_score,
+        travel_min,
+        _,
+    ) = simulate_route(
+        route,
+        candidates,
+        provider,
+        start_lat,
+        start_lon,
+        start_minute,
+    )
+
+    categories = [
+        x["category"]
+        for x in schedule
+    ]
+
+    coverage_bonus = (
+        category_quota_bonus(
+            categories,
+            selected_categories,
+        )
+    )
+
+    flow_score = (
+        natural_flow_score(
+            schedule
+        )
+    )
+
+    tour_diversity = (
+        tourist_subcategory_diversity_score(
+            route,
+            candidates,
+        )
+    )
+
+    travel_penalty = (
+        travel_min
+        * 0.55
+    )
+
+    missing_count = len(
+        set(
+            selected_categories
+        )
+        - set(
+            categories
+        )
+    )
+
+    missing_penalty = (
+        missing_count
+        * 12.0
+    )
+
+    stop_bonus = (
+        min(
+            len(
+                route
+            ),
+            target_stops,
+        )
+        * 2.5
+    )
+
+    objective = (
+        place_score
+        + coverage_bonus
+        + flow_score
+        + tour_diversity
+        + stop_bonus
+        - travel_penalty
+        - missing_penalty
+    )
+
+    return (
+        objective,
+        schedule,
+    )
+
+
+def generate_route_combinations(
     candidates: pd.DataFrame,
     selected_categories: list[str],
     budget_min: float,
@@ -3294,28 +3714,26 @@ def optimize_route(
     provider: TravelTimeProvider,
     start_lat: float,
     start_lon: float,
-    start_time: str
-    = DEFAULT_START_TIME,
-) -> list[int]:
+    start_minute: int,
+) -> list[tuple[list[int], float]]:
+    """
+    Beam Search로 실제 코스 조합을 생성한다.
 
-    candidates = (
-        candidates
-        .reset_index(
-            drop=True
-        )
-    )
+    new_route = 기존 코스 + 새로운 장소
 
-    if candidates.empty:
-        return []
-
-    start_minute = (
-        parse_hhmm(
-            start_time
-        )
-    )
-
+    각 단계에서:
+    - 이미 방문한 장소 제외
+    - 가까운 관광지 중복 제외
+    - 카테고리 방문 제한 확인
+    - 여행시간 예산 확인
+    - evaluate_route()로 코스 점수 평가
+    후 상위 BEAM_WIDTH개 조합만 유지한다.
+    """
     beam = [
-        ([], 0.0)
+        (
+            [],
+            0.0,
+        )
     ]
 
     finished = []
@@ -3323,44 +3741,42 @@ def optimize_route(
     for _ in range(
         max_stops
     ):
-
         next_states = []
 
         for route, _ in beam:
-
             used = set(
                 route
             )
 
             for idx, _row in (
-                candidates.iterrows()
+                candidates
+                .iterrows()
             ):
-
-                idx = int(idx)
+                idx = int(
+                    idx
+                )
 
                 if idx in used:
                     continue
 
-                if (
-                    near_duplicate_tourist_stop(
-                        idx,
-                        route,
-                        candidates,
-                    )
+                if near_duplicate_tourist_stop(
+                    idx,
+                    route,
+                    candidates,
                 ):
                     continue
 
                 new_route = (
                     route
-                    + [idx]
+                    + [
+                        idx
+                    ]
                 )
 
-                if (
-                    violates_category_limit(
-                        new_route,
-                        candidates,
-                        selected_categories,
-                    )
+                if violates_category_limit(
+                    new_route,
+                    candidates,
+                    selected_categories,
                 ):
                     continue
 
@@ -3382,79 +3798,17 @@ def optimize_route(
                     continue
 
                 (
-                    schedule,
-                    place_score,
-                    travel_min,
-                    _,
-                ) = simulate_route(
+                    objective,
+                    _schedule,
+                ) = evaluate_route(
                     new_route,
                     candidates,
+                    selected_categories,
+                    target_stops,
                     provider,
                     start_lat,
                     start_lon,
                     start_minute,
-                )
-
-                categories = [
-                    x["category"]
-                    for x in schedule
-                ]
-
-                coverage_bonus = (
-                    category_quota_bonus(
-                        categories,
-                        selected_categories,
-                    )
-                )
-
-                flow_score = (
-                    natural_flow_score(
-                        schedule
-                    )
-                )
-
-                tour_diversity = (
-                    tourist_subcategory_diversity_score(
-                        new_route,
-                        candidates,
-                    )
-                )
-
-                travel_penalty = (
-                    travel_min
-                    * 0.55
-                )
-
-                missing_count = len(
-                    set(
-                        selected_categories
-                    )
-                    - set(categories)
-                )
-
-                missing_penalty = (
-                    missing_count
-                    * 12.0
-                )
-
-                stop_bonus = (
-                    min(
-                        len(
-                            new_route
-                        ),
-                        target_stops,
-                    )
-                    * 2.5
-                )
-
-                objective = (
-                    place_score
-                    + coverage_bonus
-                    + flow_score
-                    + tour_diversity
-                    + stop_bonus
-                    - travel_penalty
-                    - missing_penalty
                 )
 
                 state = (
@@ -3485,9 +3839,10 @@ def optimize_route(
         for route, score in (
             next_states
         ):
-
             signature = (
-                frozenset(route),
+                frozenset(
+                    route
+                ),
                 route[-1],
             )
 
@@ -3506,27 +3861,54 @@ def optimize_route(
             )
 
             if (
-                len(unique)
+                len(
+                    unique
+                )
                 >= BEAM_WIDTH
             ):
                 break
 
         beam = unique
 
-    if not finished:
+    return finished
+
+
+def select_best_route(
+    combinations: list[
+        tuple[
+            list[int],
+            float,
+        ]
+    ],
+    candidates: pd.DataFrame,
+    selected_categories: list[str],
+    target_stops: int,
+) -> list[int]:
+    """
+    생성된 코스 조합들 중 최종 코스를 선택한다.
+
+    우선순위:
+    1. 선택 카테고리 포함 수
+    2. 목표 방문장소 수 충족 정도
+    3. 코스 평가 objective
+    """
+    if not combinations:
         return []
 
     def final_key(
         state,
     ):
-        route, objective = state
+        route, objective = (
+            state
+        )
 
         categories = {
             candidates.loc[
                 idx,
                 "추천카테고리",
             ]
-            for idx in route
+            for idx
+            in route
         }
 
         coverage = len(
@@ -3539,18 +3921,79 @@ def optimize_route(
         return (
             coverage,
             min(
-                len(route),
+                len(
+                    route
+                ),
                 target_stops,
             ),
             objective,
         )
 
     best = max(
-        finished,
+        combinations,
         key=final_key,
     )
 
     return best[0]
+
+
+def optimize_route(
+    candidates: pd.DataFrame,
+    selected_categories: list[str],
+    budget_min: float,
+    max_stops: int,
+    target_stops: int,
+    provider: TravelTimeProvider,
+    start_lat: float,
+    start_lon: float,
+    start_time: str
+    = DEFAULT_START_TIME,
+) -> list[int]:
+    """
+    코스 최적화 진입점.
+
+    generate_route_combinations()
+        ↓
+    evaluate_route()
+        ↓
+    select_best_route()
+    """
+    candidates = (
+        candidates
+        .reset_index(
+            drop=True
+        )
+    )
+
+    if candidates.empty:
+        return []
+
+    start_minute = (
+        parse_hhmm(
+            start_time
+        )
+    )
+
+    combinations = (
+        generate_route_combinations(
+            candidates,
+            selected_categories,
+            budget_min,
+            max_stops,
+            target_stops,
+            provider,
+            start_lat,
+            start_lon,
+            start_minute,
+        )
+    )
+
+    return select_best_route(
+        combinations,
+        candidates,
+        selected_categories,
+        target_stops,
+    )
 
 
 # ============================================================
@@ -3651,20 +4094,63 @@ def build_route_detail(
                         ),
                         2,
                     ),
+                "로컬성향점수":
+                    (
+                        round(
+                            float(
+                                row[
+                                    "로컬성향점수"
+                                ]
+                            ),
+                            2,
+                        )
+                        if pd.notna(
+                            row[
+                                "로컬성향점수"
+                            ]
+                        )
+                        else np.nan
+                    ),
+                "유명성향점수":
+                    (
+                        round(
+                            float(
+                                row[
+                                    "유명성향점수"
+                                ]
+                            ),
+                            2,
+                        )
+                        if pd.notna(
+                            row[
+                                "유명성향점수"
+                            ]
+                        )
+                        else np.nan
+                    ),
+                "관광성향적합점수":
+                    round(
+                        float(
+                            row[
+                                "관광성향적합점수"
+                            ]
+                        ),
+                        2,
+                    ),
+                "개인화점수":
+                    round(
+                        float(
+                            row[
+                                "개인화점수"
+                            ]
+                        ),
+                        2,
+                    ),
                 "경로선택점수":
                     round(
                         float(
                             row[
                                 "경로선택점수"
-                            ]
-                        ),
-                        2,
-                    ),
-                "관광유형보정점수":
-                    round(
-                        float(
-                            row[
-                                "관광유형보정점수"
                             ]
                         ),
                         2,
@@ -3897,6 +4383,12 @@ def recommend_local_on_trip(
     = None,
     start_time: str
     = DEFAULT_START_TIME,
+    theme: str
+    = "일반",
+    local_weight: float
+    = DEFAULT_LOCAL_WEIGHT,
+    theme_weight: float
+    = DEFAULT_THEME_WEIGHT,
     base_dir: Path
     = BASE_DIR,
     top_region_n: int
@@ -3934,6 +4426,26 @@ def recommend_local_on_trip(
         raise ValueError(
             "지원하지 않는 카테고리: "
             f"{sorted(invalid)}"
+        )
+
+    if theme not in VALID_THEMES:
+        raise ValueError(
+            "지원하지 않는 관광성향: "
+            f"{theme}"
+        )
+
+    if not (
+        0.0 <= local_weight <= 1.0
+    ):
+        raise ValueError(
+            "local_weight는 0~1 사이여야 합니다."
+        )
+
+    if not (
+        0.0 <= theme_weight <= 1.0
+    ):
+        raise ValueError(
+            "theme_weight는 0~1 사이여야 합니다."
         )
 
     output_dir = (
@@ -4052,6 +4564,9 @@ def recommend_local_on_trip(
         selected_sido,
         selected_sigungu,
         selected_categories,
+        theme=theme,
+        local_weight=local_weight,
+        theme_weight=theme_weight,
     )
 
     category_counts = (
@@ -4276,19 +4791,47 @@ def recommend_local_on_trip(
             ),
         "시장관광지의미중복제거내역":
             market_duplicate_records,
+        "개인화정책":
+            {
+                "관광성향":
+                    theme,
+                "로컬가중치":
+                    local_weight,
+                "유명가중치":
+                    round(
+                        1.0
+                        - local_weight,
+                        4,
+                    ),
+                "관광성향가중치":
+                    (
+                        0.0
+                        if theme == "일반"
+                        else theme_weight
+                    ),
+                "후보선정순서":
+                    (
+                        "지역 전체 후보 → 로컬/유명 + 관광성향 개인화점수 "
+                        "→ 카테고리별 TOP 후보 → 코스 조합"
+                    ),
+            },
         "점수정책":
             {
                 "장소추천점수":
-                    "카테고리 내부 후보 선정용 원본 점수",
+                    "원본 데이터의 카테고리 내부 참고 점수",
+                "로컬성향점수":
+                    "현지인순위를 1~100 공통척도로 변환",
+                "유명성향점수":
+                    "외지인순위를 1~100 공통척도로 변환",
+                "개인화점수":
+                    (
+                        "로컬/유명 가중치와 관광성향 적합도를 "
+                        "후보 선정 전에 결합한 점수"
+                    ),
                 "경로선택점수":
                     (
-                        "카테고리내순위를 공통 100~55점 척도로 변환한 "
-                        "경로 최적화용 점수"
-                    ),
-                "관광지유형보정":
-                    (
-                        "일반 관광에서 자연·문화·생태 계열 소폭 우대, "
-                        "레저·웰니스 계열 과다선택 완화"
+                        "개인화점수 기준 카테고리내순위를 "
+                        "100~55 공통척도로 변환한 코스 최적화 점수"
                     ),
             },
         "여행유형":
@@ -4423,7 +4966,7 @@ def recommend_local_on_trip(
         "=" * 72
     )
     print(
-        "LOCAL:ON v5.1 추천 완료"
+        "LOCAL:ON v6 추천 완료"
     )
     print(
         "=" * 72
@@ -4455,6 +4998,7 @@ def recommend_local_on_trip(
                 "카테고리",
                 "세부분류",
                 "장소추천점수",
+                "개인화점수",
                 "경로선택점수",
                 "이전장소에서_이동분",
             ]
@@ -4512,7 +5056,7 @@ def main():
     parser = (
         argparse.ArgumentParser(
             description=(
-                "LOCAL:ON v5.1 "
+                "LOCAL:ON v6 "
                 "지역/장소/경로 추천"
             )
         )
@@ -4570,6 +5114,42 @@ def main():
     )
 
     parser.add_argument(
+        "--theme",
+        default="일반",
+        choices=[
+            "일반",
+            "자연/힐링",
+            "문화/역사",
+            "레저/체험",
+            "로컬/시장",
+        ],
+        help=(
+            "관광성향: 일반 / 자연/힐링 / 문화/역사 / "
+            "레저/체험 / 로컬/시장"
+        ),
+    )
+
+    parser.add_argument(
+        "--local-weight",
+        type=float,
+        default=DEFAULT_LOCAL_WEIGHT,
+        help=(
+            "로컬 선호 가중치 0~1. "
+            "유명 가중치는 자동으로 1-local_weight"
+        ),
+    )
+
+    parser.add_argument(
+        "--theme-weight",
+        type=float,
+        default=DEFAULT_THEME_WEIGHT,
+        help=(
+            "관광성향 가중치 0~1. "
+            "theme=일반이면 자동으로 0 적용"
+        ),
+    )
+
+    parser.add_argument(
         "--start-time",
         default=(
             DEFAULT_START_TIME
@@ -4622,6 +5202,15 @@ def main():
         ),
         start_time=(
             args.start_time
+        ),
+        theme=(
+            args.theme
+        ),
+        local_weight=(
+            args.local_weight
+        ),
+        theme_weight=(
+            args.theme_weight
         ),
         base_dir=Path(
             args.base_dir
